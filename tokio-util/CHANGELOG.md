@@ -1,3 +1,10 @@
+# Unreleased
+
+### Added
+
+- sync: add `CancellationToken::cancel_with_reason` and
+  `CancellationToken::cancellation_reason`
+
 # 0.7.19 (July 21st, 2026)
 
 ### Added

@@ -6,6 +6,7 @@ mod tree_node;
 
 use crate::loom::sync::Arc;
 use crate::util::MaybeDangling;
+use core::any::Any;
 use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll};
@@ -218,12 +219,86 @@ impl CancellationToken {
     /// `false` from `is_cancelled` on another child node. However, once the
     /// call to `cancel` returns, all child nodes have been fully cancelled.
     pub fn cancel(&self) {
-        tree_node::cancel(&self.inner);
+        self.cancel_with_reason(());
+    }
+
+    /// Cancel the [`CancellationToken`] and all child tokens which had been
+    /// derived from it, providing a reason for the cancellation.
+    ///
+    /// This will wake up all tasks which are waiting for cancellation.
+    ///
+    /// The reason is shared with the whole cancelled subtree: it is visible
+    /// through [`CancellationToken::cancellation_reason`] on this token, on
+    /// all of its children, on child tokens created after the cancellation,
+    /// and for waiters that only start waiting after the cancellation
+    /// happened. It is guaranteed that the reason is already in place at the
+    /// moment any observer can see the token as cancelled; there is no
+    /// window in which a cancelled token has no reason.
+    ///
+    /// Cancellation is irreversible and only the first cancellation takes
+    /// effect: if the token was already cancelled (through `cancel`,
+    /// `cancel_with_reason`, or the cancellation of a parent token), the
+    /// provided reason is discarded and the previously stored reason is
+    /// kept.
+    ///
+    /// Be aware that cancellation is not an atomic operation. It is possible
+    /// for another thread running in parallel with a call to
+    /// `cancel_with_reason` to first receive `true` from `is_cancelled` on
+    /// one child node, and then receive `false` from `is_cancelled` on
+    /// another child node. However, once the call to `cancel_with_reason`
+    /// returns, all child nodes have been fully cancelled.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use tokio_util::sync::CancellationToken;
+    ///
+    /// let token = CancellationToken::new();
+    /// token.cancel_with_reason("shutting down");
+    ///
+    /// let reason = token.cancellation_reason().unwrap();
+    /// assert_eq!(Some(&"shutting down"), reason.downcast_ref::<&str>());
+    /// ```
+    pub fn cancel_with_reason<R>(&self, reason: R)
+    where
+        R: Any + Send + Sync,
+    {
+        tree_node::cancel(&self.inner, Arc::new(reason));
     }
 
     /// Returns `true` if the `CancellationToken` is cancelled.
     pub fn is_cancelled(&self) -> bool {
         tree_node::is_cancelled(&self.inner)
+    }
+
+    /// Returns the reason the [`CancellationToken`] was cancelled with, or
+    /// `None` if it is not cancelled.
+    ///
+    /// The reason is the value that was passed to
+    /// [`CancellationToken::cancel_with_reason`] when the token (or one of
+    /// its parents) was cancelled. If the token was cancelled through
+    /// [`CancellationToken::cancel`], the reason is the unit value `()`.
+    ///
+    /// The reason is type-erased; use [`Any::downcast_ref`] to recover the
+    /// concrete type:
+    ///
+    /// ```
+    /// use tokio_util::sync::CancellationToken;
+    ///
+    /// let token = CancellationToken::new();
+    /// assert!(token.cancellation_reason().is_none());
+    ///
+    /// token.cancel_with_reason(42_u32);
+    /// let reason = token.cancellation_reason().unwrap();
+    /// assert_eq!(Some(&42_u32), reason.downcast_ref::<u32>());
+    /// ```
+    ///
+    /// The same reason is observed by everyone: tokens cloned from this one,
+    /// child tokens (including child tokens created after the cancellation),
+    /// and tasks that only start waiting for cancellation after it already
+    /// happened.
+    pub fn cancellation_reason(&self) -> Option<&(dyn Any + Send + Sync + 'static)> {
+        tree_node::reason(&self.inner).map(AsRef::as_ref)
     }
 
     /// Returns a [`Future`] that gets fulfilled when cancellation is requested.

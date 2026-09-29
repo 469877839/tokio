@@ -43,6 +43,188 @@ fn cancel_token() {
 }
 
 #[test]
+fn cancel_token_with_reason() {
+    let (waker, wake_counter) = new_count_waker();
+    let token = CancellationToken::new();
+    assert!(token.cancellation_reason().is_none());
+
+    let wait_fut = token.cancelled();
+    pin!(wait_fut);
+    assert_eq!(
+        Poll::Pending,
+        wait_fut.as_mut().poll(&mut Context::from_waker(&waker))
+    );
+
+    token.cancel_with_reason("shutting down");
+    assert_eq!(wake_counter, 1);
+    assert!(token.is_cancelled());
+
+    // The reason is visible as soon as the token is observed to be cancelled.
+    let reason = token.cancellation_reason().unwrap();
+    assert_eq!(Some(&"shutting down"), reason.downcast_ref::<&str>());
+
+    // Waiters that were already attached get woken up.
+    assert_eq!(
+        Poll::Ready(()),
+        wait_fut.as_mut().poll(&mut Context::from_waker(&waker))
+    );
+
+    // Waiters that attach only after the cancellation still complete and
+    // still see the reason.
+    let late_fut = token.cancelled();
+    pin!(late_fut);
+    assert_eq!(
+        Poll::Ready(()),
+        late_fut.as_mut().poll(&mut Context::from_waker(&waker))
+    );
+    let reason = token.cancellation_reason().unwrap();
+    assert_eq!(Some(&"shutting down"), reason.downcast_ref::<&str>());
+}
+
+#[test]
+fn cancel_without_reason_stores_unit_reason() {
+    let token = CancellationToken::new();
+    token.cancel();
+
+    let reason = token.cancellation_reason().unwrap();
+    assert_eq!(Some(&()), reason.downcast_ref::<()>());
+}
+
+#[test]
+fn first_cancellation_reason_wins() {
+    let token = CancellationToken::new();
+    token.cancel_with_reason(1_u32);
+    token.cancel_with_reason(2_u32);
+    token.cancel();
+
+    let reason = token.cancellation_reason().unwrap();
+    assert_eq!(Some(&1_u32), reason.downcast_ref::<u32>());
+}
+
+#[test]
+fn cancellation_reason_is_shared_with_clones_and_children() {
+    let token = CancellationToken::new();
+    let cloned_token = token.clone();
+    let child_token = token.child_token();
+    let grandchild_token = child_token.child_token();
+
+    token.cancel_with_reason(String::from("parent says stop"));
+
+    for token in [&token, &cloned_token, &child_token, &grandchild_token] {
+        assert!(token.is_cancelled());
+        let reason = token.cancellation_reason().unwrap();
+        assert_eq!(
+            Some(&String::from("parent says stop")),
+            reason.downcast_ref::<String>()
+        );
+    }
+
+    // Children created after the cancellation inherit the reason as well.
+    let late_child = token.child_token();
+    assert!(late_child.is_cancelled());
+    let reason = late_child.cancellation_reason().unwrap();
+    assert_eq!(
+        Some(&String::from("parent says stop")),
+        reason.downcast_ref::<String>()
+    );
+}
+
+#[test]
+fn cancellation_reason_survives_dropped_intermediate_tokens() {
+    let token = CancellationToken::new();
+    let intermediate_token = token.child_token();
+    let child_token = intermediate_token.child_token();
+    drop(intermediate_token);
+
+    token.cancel_with_reason(7_u8);
+
+    assert!(child_token.is_cancelled());
+    let reason = child_token.cancellation_reason().unwrap();
+    assert_eq!(Some(&7_u8), reason.downcast_ref::<u8>());
+}
+
+#[test]
+fn child_cancelled_directly_keeps_its_own_reason() {
+    let token = CancellationToken::new();
+    let child_token = token.child_token();
+    let sibling_token = token.child_token();
+
+    child_token.cancel_with_reason("child reason");
+    token.cancel_with_reason("parent reason");
+
+    // The child was cancelled first, so its reason is kept.
+    let reason = child_token.cancellation_reason().unwrap();
+    assert_eq!(Some(&"child reason"), reason.downcast_ref::<&str>());
+
+    // The sibling gets cancelled by the parent and sees the parent's reason.
+    let reason = sibling_token.cancellation_reason().unwrap();
+    assert_eq!(Some(&"parent reason"), reason.downcast_ref::<&str>());
+
+    // The parent itself is not cancelled by its children.
+    let reason = token.cancellation_reason().unwrap();
+    assert_eq!(Some(&"parent reason"), reason.downcast_ref::<&str>());
+}
+
+#[test]
+fn cancellation_reason_is_visible_to_owned_waiters() {
+    let token = CancellationToken::new();
+    let wait_fut = token.clone().cancelled_owned();
+    pin!(wait_fut);
+
+    token.cancel_with_reason(3.5_f64);
+
+    let (waker, _) = new_count_waker();
+    assert_eq!(
+        Poll::Ready(()),
+        wait_fut.as_mut().poll(&mut Context::from_waker(&waker))
+    );
+    let reason = token.cancellation_reason().unwrap();
+    assert_eq!(Some(&3.5_f64), reason.downcast_ref::<f64>());
+}
+
+#[test]
+fn concurrent_cancellation_reason_first_wins() {
+    for _ in 0..100 {
+        let token = CancellationToken::new();
+        let child_token = token.child_token();
+
+        std::thread::scope(|scope| {
+            for i in 0..8_u32 {
+                let token = token.clone();
+                scope.spawn(move || {
+                    token.cancel_with_reason(i);
+                });
+            }
+        });
+
+        // Exactly one reason won the race, and every observer agrees on it.
+        let reason = *token
+            .cancellation_reason()
+            .unwrap()
+            .downcast_ref::<u32>()
+            .unwrap();
+        assert!(reason < 8);
+        assert_eq!(
+            Some(&reason),
+            child_token
+                .cancellation_reason()
+                .unwrap()
+                .downcast_ref::<u32>()
+        );
+
+        // A child created after the cancellation sees the same reason.
+        let late_child = token.child_token();
+        assert_eq!(
+            Some(&reason),
+            late_child
+                .cancellation_reason()
+                .unwrap()
+                .downcast_ref::<u32>()
+        );
+    }
+}
+
+#[test]
 fn cancel_token_owned() {
     let (waker, wake_counter) = new_count_waker();
     let token = CancellationToken::new();

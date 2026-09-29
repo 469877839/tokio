@@ -39,6 +39,16 @@
 //! before its child.
 //!
 use crate::loom::sync::{Arc, Mutex, MutexGuard};
+use core::any::Any;
+use core::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
+
+/// The reason why a [`TreeNode`] was cancelled.
+///
+/// The reason is type-erased so that [`crate::sync::CancellationToken`] can
+/// stay a non-generic type. It is shared between all nodes of a cancelled
+/// subtree, so every node only stores a cheap `Arc` clone of the same value.
+pub(crate) type CancelReason = Arc<dyn Any + Send + Sync>;
 
 /// A node of the cancellation tree structure
 ///
@@ -46,6 +56,21 @@ use crate::loom::sync::{Arc, Mutex, MutexGuard};
 pub(crate) struct TreeNode {
     inner: Mutex<Inner>,
     waker: tokio::sync::Notify,
+    /// Fast-path mirror of the cancelled state.
+    ///
+    /// This allows checking whether the node is cancelled with a single
+    /// atomic load, without locking `inner`. It is only ever written while
+    /// holding the `inner` lock of this node, so locked sections can rely on
+    /// it as well.
+    is_cancelled: AtomicBool,
+    /// The reason the node was cancelled with.
+    ///
+    /// It is always initialized *before* `is_cancelled` is set to `true`
+    /// (both happen while holding the `inner` lock of this node), so any
+    /// observer that sees the node as cancelled is guaranteed to find the
+    /// reason here. Since cancellation is irreversible and the first cancel
+    /// wins, the value is written at most once.
+    reason: OnceLock<CancelReason>,
 }
 impl TreeNode {
     pub(crate) fn new() -> Self {
@@ -54,15 +79,55 @@ impl TreeNode {
                 parent: None,
                 parent_idx: 0,
                 children: vec![],
-                is_cancelled: false,
                 num_handles: 1,
             }),
             waker: tokio::sync::Notify::new(),
+            is_cancelled: AtomicBool::new(false),
+            reason: OnceLock::new(),
         }
     }
 
     pub(crate) fn notified(&self) -> tokio::sync::futures::Notified<'_> {
         self.waker.notified()
+    }
+
+    /// Returns whether or not the node is cancelled.
+    ///
+    /// This is a single atomic load and never locks.
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.is_cancelled.load(Ordering::Acquire)
+    }
+
+    /// Returns the reason the node was cancelled with, if it is cancelled.
+    ///
+    /// The reason is guaranteed to be present once the node is observed to
+    /// be cancelled; there is no window in which a cancelled node has no
+    /// reason.
+    pub(crate) fn reason(&self) -> Option<&CancelReason> {
+        if self.is_cancelled() {
+            // The reason is always stored before the cancelled flag is set,
+            // and the `Acquire` load above pairs with the `Release` store of
+            // the flag, so the slot is initialized here.
+            Some(
+                self.reason
+                    .get()
+                    .expect("a cancelled node always has a reason"),
+            )
+        } else {
+            None
+        }
+    }
+
+    /// Marks the node as cancelled with the given reason.
+    ///
+    /// The reason is stored before the cancelled flag becomes visible, so
+    /// that no observer can see the node as cancelled without its reason.
+    ///
+    /// The `inner` lock of this node MUST be held while calling this.
+    fn set_cancelled(&self, reason: &CancelReason) {
+        // The first cancellation wins; ignore a reason that is already set.
+        let _ = self.reason.set(reason.clone());
+        self.is_cancelled.store(true, Ordering::Release);
     }
 }
 
@@ -74,13 +139,17 @@ struct Inner {
     parent: Option<Arc<TreeNode>>,
     parent_idx: usize,
     children: Vec<Arc<TreeNode>>,
-    is_cancelled: bool,
     num_handles: usize,
 }
 
 /// Returns whether or not the node is cancelled
 pub(crate) fn is_cancelled(node: &Arc<TreeNode>) -> bool {
-    node.inner.lock().unwrap().is_cancelled
+    node.is_cancelled()
+}
+
+/// Returns the reason the node was cancelled with, if it is cancelled
+pub(crate) fn reason(node: &Arc<TreeNode>) -> Option<&CancelReason> {
+    node.reason()
 }
 
 /// Creates a child node
@@ -90,16 +159,23 @@ pub(crate) fn child_node(parent: &Arc<TreeNode>) -> Arc<TreeNode> {
     // Do not register as child if we are already cancelled.
     // Cancelled trees can never be uncancelled and therefore
     // need no connection to parents or children any more.
-    if locked_parent.is_cancelled {
+    if parent.is_cancelled() {
+        // The child is created in cancelled state and inherits the reason of
+        // the parent, so that late-created children observe the same reason.
+        let reason = parent
+            .reason()
+            .expect("a cancelled node always has a reason")
+            .clone();
         return Arc::new(TreeNode {
             inner: Mutex::new(Inner {
                 parent: None,
                 parent_idx: 0,
                 children: vec![],
-                is_cancelled: true,
                 num_handles: 1,
             }),
             waker: tokio::sync::Notify::new(),
+            is_cancelled: AtomicBool::new(true),
+            reason: OnceLock::from(reason),
         });
     }
 
@@ -108,10 +184,11 @@ pub(crate) fn child_node(parent: &Arc<TreeNode>) -> Arc<TreeNode> {
             parent: Some(parent.clone()),
             parent_idx: locked_parent.children.len(),
             children: vec![],
-            is_cancelled: false,
             num_handles: 1,
         }),
         waker: tokio::sync::Notify::new(),
+        is_cancelled: AtomicBool::new(false),
+        reason: OnceLock::new(),
     });
 
     locked_parent.children.push(child.clone());
@@ -294,12 +371,25 @@ pub(crate) fn decrease_handle_refcount(node: &Arc<TreeNode>) {
 }
 
 /// Cancels a node and its children.
-pub(crate) fn cancel(node: &Arc<TreeNode>) {
+///
+/// The given `reason` is stored in every node that gets cancelled by this
+/// call, before the node becomes observable as cancelled. Nodes that were
+/// already cancelled keep their original reason (the first cancel wins).
+pub(crate) fn cancel(node: &Arc<TreeNode>, reason: CancelReason) {
     let mut locked_node = node.inner.lock().unwrap();
 
-    if locked_node.is_cancelled {
+    if node.is_cancelled() {
         return;
     }
+
+    // Store the reason in the node itself before anything else, so that it
+    // is in place before the node's cancelled flag is set below. The node
+    // is not yet cancelled, so its reason slot is still empty.
+    let _ = node.reason.set(reason);
+    let reason = node
+        .reason
+        .get()
+        .expect("a cancelled node always has a reason");
 
     // One by one, adopt grandchildren and then cancel and detach the child
     while let Some(child) = locked_node.children.pop() {
@@ -313,7 +403,7 @@ pub(crate) fn cancel(node: &Arc<TreeNode>) {
         locked_child.parent_idx = 0;
 
         // If child is already cancelled, detaching is enough
-        if locked_child.is_cancelled {
+        if child.is_cancelled() {
             continue;
         }
 
@@ -328,7 +418,7 @@ pub(crate) fn cancel(node: &Arc<TreeNode>) {
             locked_grandchild.parent_idx = 0;
 
             // If grandchild is already cancelled, detaching is enough
-            if locked_grandchild.is_cancelled {
+            if grandchild.is_cancelled() {
                 continue;
             }
 
@@ -336,7 +426,7 @@ pub(crate) fn cancel(node: &Arc<TreeNode>) {
             // Otherwise, just cancel them right away, no need for another iteration.
             if locked_grandchild.children.is_empty() {
                 // Cancel the grandchild
-                locked_grandchild.is_cancelled = true;
+                grandchild.set_cancelled(reason);
                 locked_grandchild.children = Vec::new();
                 drop(locked_grandchild);
                 grandchild.waker.notify_waiters();
@@ -350,7 +440,7 @@ pub(crate) fn cancel(node: &Arc<TreeNode>) {
         }
 
         // Cancel the child
-        locked_child.is_cancelled = true;
+        child.set_cancelled(reason);
         locked_child.children = Vec::new();
         drop(locked_child);
         child.waker.notify_waiters();
@@ -360,7 +450,7 @@ pub(crate) fn cancel(node: &Arc<TreeNode>) {
     }
 
     // Cancel the node itself.
-    locked_node.is_cancelled = true;
+    node.set_cancelled(reason);
     locked_node.children = Vec::new();
     drop(locked_node);
     node.waker.notify_waiters();
