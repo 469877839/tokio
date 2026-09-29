@@ -471,7 +471,7 @@ cfg_sync! {
     pub mod oneshot;
 
     pub(crate) mod batch_semaphore;
-    pub use batch_semaphore::{AcquireError, TryAcquireError};
+    pub use batch_semaphore::{AcquireError, Priority, TryAcquireError};
 
     mod semaphore;
     pub use semaphore::{Semaphore, SemaphorePermit, OwnedSemaphorePermit};

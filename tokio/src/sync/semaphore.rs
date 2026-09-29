@@ -1,5 +1,5 @@
 use super::batch_semaphore as ll; // low level implementation
-use super::{AcquireError, TryAcquireError};
+use super::{AcquireError, Priority, TryAcquireError};
 #[cfg(all(tokio_unstable, feature = "tracing"))]
 use crate::util::trace;
 use std::sync::Arc;
@@ -22,6 +22,33 @@ use std::sync::Arc;
 /// more permits than currently available, this can prevent a call to `acquire`
 /// from completing, even if the semaphore has enough permits complete the call
 /// to `acquire`.
+///
+/// # Priorities
+///
+/// In addition to the fair [`acquire`] and [`acquire_many`] methods, the
+/// semaphore offers priority-aware variants: [`acquire_with_priority`] and
+/// [`acquire_many_with_priority`] (plus their `_owned` and `blocking_`
+/// counterparts). A queued [`Priority::High`] request is granted permits
+/// ahead of [`Priority::Low`] requests that were queued earlier, which is
+/// useful when interactive work must not wait behind a long queue of
+/// background work.
+///
+/// Requests at the same priority remain strictly fair: they are granted in
+/// request order, and a request at the front of a priority level that needs
+/// more permits than are currently available blocks later requests at that
+/// same level. Because [`acquire`]/[`acquire_many`] always use
+/// [`Priority::Low`], a semaphore that never uses the priority-aware methods
+/// behaves exactly like the fair semaphore described above.
+///
+/// To make sure a continuous stream of high-priority requests cannot postpone
+/// low-priority requests forever, the semaphore serves the oldest queued
+/// request after a bounded number of high-priority requests have overtaken it,
+/// regardless of priority.
+///
+/// [`acquire`]: Semaphore::acquire
+/// [`acquire_many`]: Semaphore::acquire_many
+/// [`acquire_with_priority`]: Semaphore::acquire_with_priority
+/// [`acquire_many_with_priority`]: Semaphore::acquire_many_with_priority
 ///
 /// To use the `Semaphore` in a poll function, you can use the [`PollSemaphore`]
 /// utility.
@@ -678,6 +705,132 @@ impl Semaphore {
         })
     }
 
+    /// Acquires a permit from the semaphore at the given [`Priority`].
+    ///
+    /// This is identical to [`acquire`], except that while the caller is
+    /// queued waiting for permits, a [`Priority::High`] request is woken
+    /// ahead of [`Priority::Low`] requests that were queued earlier. Requests
+    /// at the same priority are still served in request order.
+    ///
+    /// Strict priority would allow a continuous stream of high-priority
+    /// requests to delay low-priority requests indefinitely. To prevent this,
+    /// the semaphore serves the oldest queued request at least once after a
+    /// fixed number of high-priority requests have overtaken it, even if it
+    /// has lower priority. See the [`Priority`] documentation for details.
+    ///
+    /// [`acquire`]: Semaphore::acquire
+    ///
+    /// # Cancel safety
+    ///
+    /// This method uses a queue to distribute permits. Cancelling a call to
+    /// `acquire_with_priority` makes you lose your place in the queue; any
+    /// permits already assigned to this acquisition are handed to the
+    /// remaining waiters.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use tokio::sync::{Priority, Semaphore};
+    ///
+    /// # #[tokio::main(flavor = "current_thread")]
+    /// # async fn main() {
+    /// let semaphore = Semaphore::new(1);
+    ///
+    /// let permit = semaphore
+    ///     .acquire_with_priority(Priority::High)
+    ///     .await
+    ///     .unwrap();
+    /// # drop(permit);
+    /// # }
+    /// ```
+    pub async fn acquire_with_priority(
+        &self,
+        priority: Priority,
+    ) -> Result<SemaphorePermit<'_>, AcquireError> {
+        #[cfg(all(tokio_unstable, feature = "tracing"))]
+        let inner = trace::async_op(
+            || self.ll_sem.acquire_priority(1, priority),
+            self.resource_span.clone(),
+            "Semaphore::acquire_with_priority",
+            "poll",
+            true,
+        );
+        #[cfg(not(all(tokio_unstable, feature = "tracing")))]
+        let inner = self.ll_sem.acquire_priority(1, priority);
+
+        inner.await?;
+        Ok(SemaphorePermit {
+            sem: self,
+            permits: 1,
+        })
+    }
+
+    /// Acquires `n` permits from the semaphore at the given [`Priority`].
+    ///
+    /// This is identical to [`acquire_many`], except that while the caller is
+    /// queued waiting for permits, a [`Priority::High`] request is woken
+    /// ahead of [`Priority::Low`] requests that were queued earlier. Requests
+    /// at the same priority are still served in request order.
+    ///
+    /// As with [`acquire_many`], a queued request that needs more permits
+    /// than are currently released keeps its place and accumulates permits;
+    /// it does not block higher-priority requests behind it from completing.
+    ///
+    /// Strict priority would allow a continuous stream of high-priority
+    /// requests to delay low-priority requests indefinitely. To prevent this,
+    /// the semaphore serves the oldest queued request at least once after a
+    /// fixed number of high-priority requests have overtaken it, even if it
+    /// has lower priority.
+    ///
+    /// [`acquire_many`]: Semaphore::acquire_many
+    ///
+    /// # Cancel safety
+    ///
+    /// This method uses a queue to distribute permits. Cancelling a call to
+    /// `acquire_many_with_priority` makes you lose your place in the queue;
+    /// any permits already assigned to this acquisition are handed to the
+    /// remaining waiters.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use tokio::sync::{Priority, Semaphore};
+    ///
+    /// # #[tokio::main(flavor = "current_thread")]
+    /// # async fn main() {
+    /// let semaphore = Semaphore::new(5);
+    ///
+    /// let permit = semaphore
+    ///     .acquire_many_with_priority(3, Priority::High)
+    ///     .await
+    ///     .unwrap();
+    /// assert_eq!(semaphore.available_permits(), 2);
+    /// # drop(permit);
+    /// # }
+    /// ```
+    pub async fn acquire_many_with_priority(
+        &self,
+        n: u32,
+        priority: Priority,
+    ) -> Result<SemaphorePermit<'_>, AcquireError> {
+        #[cfg(all(tokio_unstable, feature = "tracing"))]
+        let inner = trace::async_op(
+            || self.ll_sem.acquire_priority(n as usize, priority),
+            self.resource_span.clone(),
+            "Semaphore::acquire_many_with_priority",
+            "poll",
+            true,
+        );
+        #[cfg(not(all(tokio_unstable, feature = "tracing")))]
+        let inner = self.ll_sem.acquire_priority(n as usize, priority);
+
+        inner.await?;
+        Ok(SemaphorePermit {
+            sem: self,
+            permits: n as usize,
+        })
+    }
+
     /// Tries to acquire a permit from the semaphore.
     ///
     /// If the semaphore has been closed, this returns a [`TryAcquireError::Closed`]
@@ -839,6 +992,49 @@ impl Semaphore {
         crate::future::block_on(self.acquire_many(n))
     }
 
+    /// Acquires a permit from the semaphore at the given [`Priority`],
+    /// blocking the current thread until one is available.
+    ///
+    /// This method is the blocking equivalent of
+    /// [`acquire_with_priority`].
+    ///
+    /// # Panics
+    ///
+    /// This function panics if called within an asynchronous execution
+    /// context.
+    ///
+    /// [`acquire_with_priority`]: Semaphore::acquire_with_priority
+    #[track_caller]
+    #[cfg(feature = "sync")]
+    pub fn blocking_acquire_with_priority(
+        &self,
+        priority: Priority,
+    ) -> Result<SemaphorePermit<'_>, AcquireError> {
+        crate::future::block_on(self.acquire_with_priority(priority))
+    }
+
+    /// Acquires `n` permits from the semaphore at the given [`Priority`],
+    /// blocking the current thread until they are available.
+    ///
+    /// This method is the blocking equivalent of
+    /// [`acquire_many_with_priority`].
+    ///
+    /// # Panics
+    ///
+    /// This function panics if called within an asynchronous execution
+    /// context.
+    ///
+    /// [`acquire_many_with_priority`]: Semaphore::acquire_many_with_priority
+    #[track_caller]
+    #[cfg(feature = "sync")]
+    pub fn blocking_acquire_many_with_priority(
+        &self,
+        n: u32,
+        priority: Priority,
+    ) -> Result<SemaphorePermit<'_>, AcquireError> {
+        crate::future::block_on(self.acquire_many_with_priority(n, priority))
+    }
+
     /// Acquires a permit from the semaphore.
     ///
     /// The semaphore must be wrapped in an [`Arc`] to call this method.
@@ -956,6 +1152,81 @@ impl Semaphore {
         );
         #[cfg(not(all(tokio_unstable, feature = "tracing")))]
         let inner = self.ll_sem.acquire(n as usize);
+
+        inner.await?;
+        Ok(OwnedSemaphorePermit {
+            sem: self,
+            permits: n as usize,
+        })
+    }
+
+    /// Acquires a permit from the semaphore at the given [`Priority`].
+    ///
+    /// The semaphore must be wrapped in an [`Arc`] to call this method.
+    /// Otherwise, this is the owned equivalent of
+    /// [`acquire_with_priority`]: a [`Priority::High`] request is woken ahead
+    /// of queued [`Priority::Low`] requests, subject to the semaphore's
+    /// anti-starvation guarantee.
+    ///
+    /// [`acquire_with_priority`]: Semaphore::acquire_with_priority
+    ///
+    /// # Cancel safety
+    ///
+    /// This method uses a queue to distribute permits. Cancelling a call to
+    /// `acquire_owned_with_priority` makes you lose your place in the queue;
+    /// any permits already assigned to this acquisition are handed to the
+    /// remaining waiters.
+    pub async fn acquire_owned_with_priority(
+        self: Arc<Self>,
+        priority: Priority,
+    ) -> Result<OwnedSemaphorePermit, AcquireError> {
+        #[cfg(all(tokio_unstable, feature = "tracing"))]
+        let inner = trace::async_op(
+            || self.ll_sem.acquire_priority(1, priority),
+            self.resource_span.clone(),
+            "Semaphore::acquire_owned_with_priority",
+            "poll",
+            true,
+        );
+        #[cfg(not(all(tokio_unstable, feature = "tracing")))]
+        let inner = self.ll_sem.acquire_priority(1, priority);
+
+        inner.await?;
+        Ok(OwnedSemaphorePermit {
+            sem: self,
+            permits: 1,
+        })
+    }
+
+    /// Acquires `n` permits from the semaphore at the given [`Priority`].
+    ///
+    /// The semaphore must be wrapped in an [`Arc`] to call this method.
+    /// Otherwise, this is the owned equivalent of
+    /// [`acquire_many_with_priority`].
+    ///
+    /// [`acquire_many_with_priority`]: Semaphore::acquire_many_with_priority
+    ///
+    /// # Cancel safety
+    ///
+    /// This method uses a queue to distribute permits. Cancelling a call to
+    /// `acquire_many_owned_with_priority` makes you lose your place in the
+    /// queue; any permits already assigned to this acquisition are handed to
+    /// the remaining waiters.
+    pub async fn acquire_many_owned_with_priority(
+        self: Arc<Self>,
+        n: u32,
+        priority: Priority,
+    ) -> Result<OwnedSemaphorePermit, AcquireError> {
+        #[cfg(all(tokio_unstable, feature = "tracing"))]
+        let inner = trace::async_op(
+            || self.ll_sem.acquire_priority(n as usize, priority),
+            self.resource_span.clone(),
+            "Semaphore::acquire_many_owned_with_priority",
+            "poll",
+            true,
+        );
+        #[cfg(not(all(tokio_unstable, feature = "tracing")))]
+        let inner = self.ll_sem.acquire_priority(n as usize, priority);
 
         inner.await?;
         Ok(OwnedSemaphorePermit {
@@ -1127,6 +1398,49 @@ impl Semaphore {
         n: u32,
     ) -> Result<OwnedSemaphorePermit, AcquireError> {
         crate::future::block_on(self.acquire_many_owned(n))
+    }
+
+    /// Acquires a permit from the semaphore at the given [`Priority`],
+    /// blocking the current thread until one is available.
+    ///
+    /// This method is the blocking equivalent of
+    /// [`acquire_owned_with_priority`].
+    ///
+    /// # Panics
+    ///
+    /// This function panics if called within an asynchronous execution
+    /// context.
+    ///
+    /// [`acquire_owned_with_priority`]: Semaphore::acquire_owned_with_priority
+    #[track_caller]
+    #[cfg(feature = "sync")]
+    pub fn blocking_acquire_owned_with_priority(
+        self: Arc<Self>,
+        priority: Priority,
+    ) -> Result<OwnedSemaphorePermit, AcquireError> {
+        crate::future::block_on(self.acquire_owned_with_priority(priority))
+    }
+
+    /// Acquires `n` permits from the semaphore at the given [`Priority`],
+    /// blocking the current thread until they are available.
+    ///
+    /// This method is the blocking equivalent of
+    /// [`acquire_many_owned_with_priority`].
+    ///
+    /// # Panics
+    ///
+    /// This function panics if called within an asynchronous execution
+    /// context.
+    ///
+    /// [`acquire_many_owned_with_priority`]: Semaphore::acquire_many_owned_with_priority
+    #[track_caller]
+    #[cfg(feature = "sync")]
+    pub fn blocking_acquire_many_owned_with_priority(
+        self: Arc<Self>,
+        n: u32,
+        priority: Priority,
+    ) -> Result<OwnedSemaphorePermit, AcquireError> {
+        crate::future::block_on(self.acquire_many_owned_with_priority(n, priority))
     }
 
     /// Closes the semaphore.

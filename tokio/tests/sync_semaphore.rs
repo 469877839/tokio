@@ -352,3 +352,142 @@ fn merge_many_permits() {
     drop(a);
     assert_eq!(sem.available_permits(), 6_000_000_000);
 }
+
+#[tokio::test]
+#[cfg(feature = "full")]
+async fn priority_acquisition() {
+    use tokio::sync::oneshot;
+    use tokio::sync::Priority;
+
+    let sem = Arc::new(Semaphore::new(1));
+
+    // Hold the only permit.
+    let held = sem.try_acquire().unwrap();
+
+    let (low_started_tx, low_started_rx) = oneshot::channel::<()>();
+    let (high_started_tx, high_started_rx) = oneshot::channel::<()>();
+    let (low_done_tx, mut low_done_rx) = oneshot::channel::<()>();
+    let (high_acquired_tx, high_acquired_rx) = oneshot::channel::<()>();
+    let (release_high_tx, release_high_rx) = oneshot::channel::<()>();
+
+    let sem_low = sem.clone();
+    let low = tokio::spawn(async move {
+        low_started_tx.send(()).unwrap();
+        let _permit = sem_low.acquire_with_priority(Priority::Low).await.unwrap();
+        low_done_tx.send(()).unwrap();
+    });
+
+    low_started_rx.await.unwrap();
+    // Give the low-priority task a chance to queue.
+    tokio::task::yield_now().await;
+
+    let sem_high = sem.clone();
+    let high = tokio::spawn(async move {
+        high_started_tx.send(()).unwrap();
+        let permit = sem_high
+            .acquire_with_priority(Priority::High)
+            .await
+            .unwrap();
+        // Hold the permit until the test tells us to release it.
+        high_acquired_tx.send(()).unwrap();
+        release_high_rx.await.unwrap();
+        drop(permit);
+    });
+
+    high_started_rx.await.unwrap();
+    tokio::task::yield_now().await;
+
+    // Releasing one permit wakes the high-priority waiter, even though the
+    // low-priority waiter queued first.
+    drop(held);
+
+    // The high waiter acquires the permit before the low one.
+    high_acquired_rx
+        .await
+        .expect("high-priority acquisition should complete first");
+    assert!(
+        low_done_rx.try_recv().is_err(),
+        "low-priority acquisition must still be pending while high holds the permit"
+    );
+
+    // After the high permit is released, the low waiter completes.
+    release_high_tx.send(()).unwrap();
+    high.await.unwrap();
+    low_done_rx.await.unwrap();
+    low.await.unwrap();
+}
+
+#[tokio::test]
+#[cfg(feature = "full")]
+async fn default_acquire_is_low_priority() {
+    use tokio::sync::Priority;
+
+    let sem = Arc::new(Semaphore::new(0));
+
+    // A default (low-priority) waiter queues first.
+    let sem_default = sem.clone();
+    let default_waiter = tokio::spawn(async move {
+        let _permit = sem_default.acquire().await.unwrap();
+    });
+
+    // A second low-priority waiter via the priority entry.
+    let sem_low = sem.clone();
+    let low_waiter = tokio::spawn(async move {
+        let _permit = sem_low.acquire_with_priority(Priority::Low).await.unwrap();
+    });
+
+    // A high-priority waiter overtakes both default and explicit-low.
+    let order = Arc::new(std::sync::Mutex::new(Vec::<&'static str>::new()));
+    let order_high = order.clone();
+    let sem_high = sem.clone();
+    let high_waiter = tokio::spawn(async move {
+        let _permit = sem_high
+            .acquire_with_priority(Priority::High)
+            .await
+            .unwrap();
+        order_high.lock().unwrap().push("high");
+    });
+
+    // Let all three tasks queue.
+    tokio::task::yield_now().await;
+    tokio::task::yield_now().await;
+
+    sem.add_permits(1);
+    high_waiter.await.unwrap();
+    assert_eq!(*order.lock().unwrap(), vec!["high"]);
+
+    sem.add_permits(2);
+    default_waiter.await.unwrap();
+    low_waiter.await.unwrap();
+}
+
+#[tokio::test]
+#[cfg(feature = "full")]
+async fn owned_priority_acquisition() {
+    use futures::poll;
+    use std::task::Poll;
+    use tokio::sync::Priority;
+
+    let sem = Arc::new(Semaphore::new(0));
+
+    let mut low = Box::pin(sem.clone().acquire_owned_with_priority(Priority::Low));
+    let mut high = Box::pin(sem.clone().acquire_owned_with_priority(Priority::High));
+
+    // Poll once to enqueue both waiters (low first, then high).
+    assert!(poll!(low.as_mut()).is_pending());
+    assert!(poll!(high.as_mut()).is_pending());
+
+    // One permit goes to the high waiter even though low queued first.
+    sem.add_permits(1);
+    let high_permit = match poll!(high.as_mut()) {
+        Poll::Ready(Ok(permit)) => permit,
+        Poll::Ready(Err(e)) => panic!("high waiter errored: {e}"),
+        Poll::Pending => panic!("high waiter did not acquire"),
+    };
+    assert!(poll!(low.as_mut()).is_pending());
+
+    // Only once the high-priority permit is released does the low waiter
+    // complete.
+    drop(high_permit);
+    assert!(matches!(poll!(low.as_mut()), Poll::Ready(Ok(_))));
+}

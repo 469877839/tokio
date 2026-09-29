@@ -308,3 +308,277 @@ fn update_permits_many_times() {
     assert_eq!(s.forget_permits(3), 3);
     assert_eq!(s.available_permits(), 0);
 }
+
+use crate::sync::batch_semaphore::Priority;
+
+#[test]
+fn high_priority_overtakes_low_priority() {
+    let s = Semaphore::new(1);
+
+    // Take the only permit.
+    assert_ready_ok!(task::spawn(s.acquire_priority(1, Priority::Low)).poll());
+
+    // A low-priority waiter queues first.
+    let mut low = task::spawn(s.acquire_priority(1, Priority::Low));
+    assert_pending!(low.poll());
+
+    // A high-priority waiter queues behind it.
+    let mut high = task::spawn(s.acquire_priority(1, Priority::High));
+    assert_pending!(high.poll());
+
+    // The single released permit goes to the high-priority waiter.
+    s.release(1);
+    assert!(high.is_woken());
+    assert!(!low.is_woken());
+    assert_ready_ok!(high.poll());
+
+    // The low-priority waiter gets the next permit.
+    s.release(1);
+    assert!(low.is_woken());
+    assert_ready_ok!(low.poll());
+}
+
+#[test]
+fn same_priority_remains_fifo_with_batch() {
+    let s = Semaphore::new(0);
+
+    // Two queued low-priority waiters, oldest first.
+    let mut first = task::spawn(s.acquire_priority(1, Priority::Low));
+    assert_pending!(first.poll());
+    let mut second = task::spawn(s.acquire_priority(1, Priority::Low));
+    assert_pending!(second.poll());
+
+    // Releasing permits one at a time wakes them in arrival order.
+    s.release(1);
+    assert!(first.is_woken());
+    assert!(!second.is_woken());
+    assert_ready_ok!(first.poll());
+
+    s.release(1);
+    assert!(second.is_woken());
+    assert_ready_ok!(second.poll());
+
+    // A single batch release also wakes every waiter it can satisfy.
+    let mut batch_first = task::spawn(s.acquire_priority(1, Priority::Low));
+    assert_pending!(batch_first.poll());
+    let mut batch_second = task::spawn(s.acquire_priority(1, Priority::Low));
+    assert_pending!(batch_second.poll());
+    s.release(2);
+    assert!(batch_first.is_woken());
+    assert!(batch_second.is_woken());
+    assert_ready_ok!(batch_first.poll());
+    assert_ready_ok!(batch_second.poll());
+}
+
+#[test]
+fn batch_drains_high_before_low_when_all_satisfiable() {
+    let s = Semaphore::new(0);
+
+    // Queue order (oldest to newest): low, high, low.
+    let mut low1 = task::spawn(s.acquire_priority(1, Priority::Low));
+    assert_pending!(low1.poll());
+    let mut high = task::spawn(s.acquire_priority(1, Priority::High));
+    assert_pending!(high.poll());
+    let mut low2 = task::spawn(s.acquire_priority(1, Priority::Low));
+    assert_pending!(low2.poll());
+
+    // Releasing one permit at a time, the high waiter overtakes the older
+    // low waiter; after that, level FIFO serves low1 before low2.
+    s.release(1);
+    assert!(high.is_woken());
+    assert!(!low1.is_woken());
+    assert!(!low2.is_woken());
+    assert_ready_ok!(high.poll());
+
+    s.release(1);
+    assert!(low1.is_woken());
+    assert!(!low2.is_woken());
+    assert_ready_ok!(low1.poll());
+
+    s.release(1);
+    assert!(low2.is_woken());
+    assert_ready_ok!(low2.poll());
+}
+
+#[test]
+fn low_priority_is_served_after_max_overtakes() {
+    let s = Semaphore::new(0);
+
+    // One low-priority waiter waits for a single permit.
+    let mut low = task::spawn(s.acquire_priority(1, Priority::Low));
+    assert_pending!(low.poll());
+
+    // Nine high-priority waiters queue behind it.
+    let mut highs = Vec::new();
+    for _ in 0..9 {
+        let mut high = task::spawn(s.acquire_priority(1, Priority::High));
+        assert_pending!(high.poll());
+        highs.push(high);
+    }
+
+    // The first eight released permits overtake the low waiter.
+    for high in highs.iter_mut().take(8) {
+        s.release(1);
+        assert!(high.is_woken(), "high-priority waiter should overtake the low waiter");
+        assert!(!low.is_woken(), "low waiter must not be woken before the limit");
+        assert_ready_ok!(high.poll());
+    }
+
+    // The ninth permit is forced to the oldest (low-priority) waiter.
+    s.release(1);
+    assert!(low.is_woken(), "anti-starvation must serve the low-priority waiter");
+    assert!(!highs[8].is_woken());
+    assert_ready_ok!(low.poll());
+
+    // The ninth high-priority waiter gets the following permit.
+    s.release(1);
+    assert!(highs[8].is_woken());
+    assert_ready_ok!(highs[8].poll());
+}
+
+#[test]
+fn large_oldest_waiter_accumulates_and_blocks_level_fifo() {
+    let s = Semaphore::new(0);
+
+    // Oldest waiter needs three permits.
+    let mut big = task::spawn(s.acquire_priority(3, Priority::Low));
+    assert_pending!(big.poll());
+
+    // A newer waiter that could take a single permit must wait: within a
+    // priority level, the oldest waiter is not skipped.
+    let mut small = task::spawn(s.acquire_priority(1, Priority::Low));
+    assert_pending!(small.poll());
+
+    s.release(1);
+    assert!(!small.is_woken());
+    assert!(!big.is_woken());
+    assert_eq!(s.available_permits(), 0);
+
+    s.release(2);
+    assert!(big.is_woken());
+    assert!(!small.is_woken());
+    assert_ready_ok!(big.poll());
+
+    s.release(1);
+    assert!(small.is_woken());
+    assert_ready_ok!(small.poll());
+}
+
+#[test]
+fn unsatisfiable_waiter_blocks_only_its_own_level() {
+    let s = Semaphore::new(0);
+
+    // Oldest low waiter needs two permits.
+    let mut big_low = task::spawn(s.acquire_priority(2, Priority::Low));
+    assert_pending!(big_low.poll());
+
+    // A newer low waiter needing one is blocked within the low level.
+    let mut small_low = task::spawn(s.acquire_priority(1, Priority::Low));
+    assert_pending!(small_low.poll());
+
+    // A newer high waiter also needing one can overtake both low waiters.
+    let mut high = task::spawn(s.acquire_priority(1, Priority::High));
+    assert_pending!(high.poll());
+
+    s.release(1);
+    assert!(high.is_woken());
+    assert!(!big_low.is_woken());
+    assert!(!small_low.is_woken());
+    assert_ready_ok!(high.poll());
+
+    // One permit cannot satisfy big_low, so the permits accumulate with it
+    // and the newer small_low waiter is still blocked (level FIFO).
+    s.release(1);
+    assert!(!big_low.is_woken());
+    assert!(!small_low.is_woken());
+    assert_eq!(s.available_permits(), 0);
+
+    // One more permit completes big_low.
+    s.release(1);
+    assert!(big_low.is_woken());
+    assert!(!small_low.is_woken());
+    assert_ready_ok!(big_low.poll());
+
+    // small_low gets the next permit.
+    s.release(1);
+    assert!(small_low.is_woken());
+    assert_ready_ok!(small_low.poll());
+}
+
+#[test]
+fn cancelled_partially_granted_waiter_keeps_queue_progressing() {
+    let s = Semaphore::new(0);
+
+    // Oldest waiter needs three permits and accumulates one partial grant.
+    let mut big = task::spawn(s.acquire_priority(3, Priority::Low));
+    assert_pending!(big.poll());
+    s.release(1);
+    assert!(!big.is_woken());
+
+    // A newer high waiter takes the next permit ahead of `big`.
+    let mut high = task::spawn(s.acquire_priority(1, Priority::High));
+    assert_pending!(high.poll());
+    s.release(1);
+    assert!(high.is_woken());
+    assert_ready_ok!(high.poll());
+
+    // Dropping the partially-granted waiter releases its accumulated permit.
+    drop(big);
+    assert_eq!(s.available_permits(), 1);
+
+    // A fresh waiter can acquire the released permit.
+    let mut next = task::spawn(s.acquire_priority(1, Priority::Low));
+    assert_ready_ok!(next.poll());
+}
+
+
+#[test]
+fn forced_low_wake_then_batch_continues_with_high() {
+    let s = Semaphore::new(0);
+
+    // Oldest low waiter.
+    let mut low = task::spawn(s.acquire_priority(1, Priority::Low));
+    assert_pending!(low.poll());
+
+    // Eight high waiters exhaust the overtake budget, one release each.
+    for _ in 0..8 {
+        let mut high = task::spawn(s.acquire_priority(1, Priority::High));
+        assert_pending!(high.poll());
+        s.release(1);
+        assert!(high.is_woken());
+        assert!(!low.is_woken());
+        assert_ready_ok!(high.poll());
+    }
+
+    // A waiting high waiter that would overtake again.
+    let mut next_high = task::spawn(s.acquire_priority(1, Priority::High));
+    assert_pending!(next_high.poll());
+
+    // A batch of two permits: the first is forced to the low waiter (which
+    // is removed from the queue), and the second immediately continues to the
+    // high waiter within the same release.
+    s.release(2);
+    assert!(low.is_woken());
+    assert!(next_high.is_woken());
+    assert_ready_ok!(low.poll());
+    assert_ready_ok!(next_high.poll());
+    assert_eq!(s.available_permits(), 0);
+}
+
+#[test]
+fn close_wakes_priority_waiters_with_error() {
+    let s = Semaphore::new(0);
+
+    let mut low = task::spawn(s.acquire_priority(1, Priority::Low));
+    assert_pending!(low.poll());
+    let mut high = task::spawn(s.acquire_priority(1, Priority::High));
+    assert_pending!(high.poll());
+
+    s.close();
+
+    assert!(low.is_woken());
+    assert!(high.is_woken());
+    assert_ready_err!(low.poll());
+    assert_ready_err!(high.poll());
+}
+

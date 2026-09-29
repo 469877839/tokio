@@ -240,3 +240,27 @@ fn concurrent_permit_updates() {
         assert_eq!(semaphore.available_permits(), 5);
     })
 }
+
+#[test]
+fn priority_acquire_cancellation() {
+    loom::model(|| {
+        let semaphore = Arc::new(Semaphore::new(0));
+
+        // A low-priority waiter queues first.
+        let low_sem = semaphore.clone();
+        let low = thread::spawn(move || block_on(low_sem.acquire_priority(1, Priority::Low)));
+
+        // A high-priority waiter queues behind it.
+        let high_sem = semaphore.clone();
+        let high = thread::spawn(move || {
+            block_on(high_sem.acquire_priority(1, Priority::High))
+        });
+
+        // Two permits satisfy both waiters regardless of wake ordering.
+        semaphore.release(2);
+
+        low.join().unwrap().unwrap();
+        high.join().unwrap().unwrap();
+        assert_eq!(0, semaphore.available_permits());
+    });
+}

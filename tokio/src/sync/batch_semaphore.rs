@@ -4,17 +4,37 @@
 //! The semaphore is implemented using an intrusive linked list of waiters. An
 //! atomic counter tracks the number of available permits. If the semaphore does
 //! not contain the required number of permits, the task attempting to acquire
-//! permits places its waker at the end of a queue. When new permits are made
-//! available (such as by releasing an initial acquisition), they are assigned
-//! to the task at the front of the queue, waking that task if its requested
-//! number of permits is met.
+//! permits places its waker in a queue. Waiters carry a [`Priority`] and are
+//! linked in arrival order: the tail of the queue is the oldest waiter and
+//! the head is the newest. When new permits are made available (such as by
+//! releasing an initial acquisition), the oldest fully-satisfiable
+//! high-priority waiter is woken first; otherwise the oldest fully-satisfiable
+//! low-priority waiter is woken. Waiters at the same priority are never
+//! reordered: the oldest waiter of a level blocks every newer waiter of that
+//! level, and a low-priority waiter is also blocked by an older
+//! high-priority waiter that still needs more permits. If no waiter can be
+//! fully satisfied, the permits accumulate with the oldest waiter, which
+//! keeps its place until enough permits have been released.
 //!
-//! Because waiters are enqueued at the back of the linked list and dequeued
-//! from the front, the semaphore is fair. Tasks trying to acquire large numbers
-//! of permits at a time will always be woken eventually, even if many other
-//! tasks are acquiring smaller numbers of permits. This means that in a
-//! use-case like tokio's read-write lock, writers will not be starved by
-//! readers.
+//! When every waiter has the same priority, this selection rule reduces to
+//! strict FIFO: waiters are woken in the order they were queued, one at a
+//! time, and a waiter requesting more permits than are currently available
+//! keeps its place at the tail and accumulates permits. Tasks trying to
+//! acquire large numbers of permits at a time are therefore always woken
+//! eventually, even if many other tasks are acquiring smaller numbers of
+//! permits. This means that in a use-case like tokio's read-write lock,
+//! writers will not be starved by readers.
+//!
+//! Strict priority ordering would let a steady stream of
+//! [`Priority::High`] waiters overtake [`Priority::Low`] waiters forever. To
+//! prevent this, the wait list tracks the number of consecutive times a
+//! newer high-priority waiter was woken ahead of an older waiter. Once the
+//! count reaches [`MAX_OVERTAKES`], the oldest waiter is served next even if
+//! it has low priority and cannot yet be fully satisfied (it simply keeps
+//! the permits and accumulates more later, exactly as a FIFO head waiter
+//! does today). The counter is reset whenever the oldest waiter is served or
+//! the queue drains. This bounds the delay of a low-priority waiter to at
+//! most `MAX_OVERTAKES` high-priority overtakes, without relying on a timer.
 use crate::loom::cell::UnsafeCell;
 use crate::loom::sync::atomic::AtomicUsize;
 use crate::loom::sync::{Mutex, MutexGuard};
@@ -43,7 +63,38 @@ pub(crate) struct Semaphore {
 struct Waitlist {
     queue: LinkedList<Waiter>,
     closed: bool,
+    /// Number of consecutive times a newer high-priority waiter has overtaken
+    /// the oldest (low-priority) waiter.
+    overtakes: usize,
 }
+
+/// The priority of a pending permit acquisition.
+///
+/// When permits become available, [`Priority::High`] waiters are woken ahead
+/// of [`Priority::Low`] waiters that were queued later, subject to the
+/// semaphore's anti-starvation guarantees (see the module documentation).
+///
+/// Among waiters with the same priority, permits are still handed out in the
+/// order the requests were queued.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Priority {
+    /// The default priority. Waiters at this level may be overtaken by
+    /// [`Priority::High`] waiters.
+    #[default]
+    Low,
+    /// A higher priority. Waiters at this level are woken before queued
+    /// [`Priority::Low`] waiters when permits become available.
+    High,
+}
+
+/// Maximum number of consecutive times a newer high-priority waiter may be
+/// woken ahead of the oldest waiter before the oldest waiter is served
+/// regardless of its priority.
+///
+/// The value is fixed rather than configurable: it is large enough that a
+/// single release still batches a useful number of high-priority wakeups,
+/// while keeping the worst-case delay of a low-priority waiter small.
+const MAX_OVERTAKES: usize = 8;
 
 /// Error returned from the [`Semaphore::try_acquire`] function.
 ///
@@ -82,6 +133,11 @@ struct Waiter {
     /// This is either the number of remaining permits required by
     /// the waiter, or a flag indicating that the waiter is not yet queued.
     state: AtomicUsize,
+
+    /// The priority at which this waiter requested its permits.
+    ///
+    /// This may only be accessed while the wait queue is locked.
+    priority: Priority,
 
     /// The waker to notify the task awaiting permits.
     ///
@@ -169,6 +225,7 @@ impl Semaphore {
             waiters: Mutex::new(Waitlist {
                 queue: LinkedList::new(),
                 closed: false,
+                overtakes: 0,
             }),
             #[cfg(all(tokio_unstable, feature = "tracing"))]
             resource_span,
@@ -187,6 +244,7 @@ impl Semaphore {
             waiters: Mutex::const_new(Waitlist {
                 queue: LinkedList::new(),
                 closed: false,
+                overtakes: 0,
             }),
             #[cfg(all(tokio_unstable, feature = "tracing"))]
             resource_span: tracing::Span::none(),
@@ -200,6 +258,7 @@ impl Semaphore {
             waiters: Mutex::new(Waitlist {
                 queue: LinkedList::new(),
                 closed: true,
+                overtakes: 0,
             }),
             #[cfg(all(tokio_unstable, feature = "tracing"))]
             resource_span: tracing::Span::none(),
@@ -214,6 +273,7 @@ impl Semaphore {
             waiters: Mutex::const_new(Waitlist {
                 queue: LinkedList::new(),
                 closed: true,
+                overtakes: 0,
             }),
             #[cfg(all(tokio_unstable, feature = "tracing"))]
             resource_span: tracing::Span::none(),
@@ -295,11 +355,19 @@ impl Semaphore {
     }
 
     pub(crate) fn acquire(&self, num_permits: usize) -> Acquire<'_> {
-        Acquire::new(self, num_permits)
+        Acquire::new(self, num_permits, Priority::Low)
     }
 
-    /// Release `rem` permits to the semaphore's wait list, starting from the
-    /// end of the queue.
+    /// Starts an acquisition of `num_permits` permits at the given priority.
+    pub(crate) fn acquire_priority(
+        &self,
+        num_permits: usize,
+        priority: Priority,
+    ) -> Acquire<'_> {
+        Acquire::new(self, num_permits, priority)
+    }
+
+    /// Release `rem` permits to the semaphore's wait list.
     ///
     /// If `rem` exceeds the number of permits needed by the wait list, the
     /// remainder are assigned back to the semaphore.
@@ -309,24 +377,42 @@ impl Semaphore {
         let mut is_empty = false;
         while rem > 0 {
             let mut waiters = lock.take().unwrap_or_else(|| self.waiters.lock());
-            'inner: while wakers.can_push() {
-                // Was the waiter assigned enough permits to wake it?
-                match waiters.queue.last() {
-                    Some(waiter) => {
-                        if !waiter.assign_permits(&mut rem) {
-                            break 'inner;
-                        }
-                    }
+            'inner: while rem > 0 && wakers.can_push() {
+                // Select the waiter to serve according to priority and the
+                // anti-starvation rules. `forced` marks the oldest waiter
+                // (whose grant may be partial); `overtook` marks a newer
+                // high-priority waiter jumping ahead of the oldest.
+                let (mut node, forced, overtook) = match Waitlist::pick_waiter(&waiters, rem) {
+                    Some(choice) => choice,
                     None => {
                         is_empty = true;
-                        // If we assigned permits to all the waiters in the queue, and there are
-                        // still permits left over, assign them back to the semaphore.
                         break 'inner;
                     }
                 };
-                let mut waiter = waiters.queue.pop_back().unwrap();
+
+                if overtook {
+                    waiters.overtakes += 1;
+                } else {
+                    // Serving the oldest waiter (including an anti-starvation
+                    // forced partial serve) refreshes the overtake budget.
+                    waiters.overtakes = 0;
+                }
+
+                // Safety: `node` is contained by the locked queue.
+                let fully_assigned = unsafe { node.as_ref() }.assign_permits(&mut rem);
+
+                if !fully_assigned {
+                    // A partial grant only ever goes to the oldest waiter,
+                    // which keeps its place and accumulates more permits on a
+                    // later release. Nothing else can be served from this
+                    // release.
+                    debug_assert!(forced);
+                    break 'inner;
+                }
+
+                unsafe { waiters.queue.remove(node) };
                 if let Some(waker) =
-                    unsafe { waiter.as_mut().waker.with_mut(|waker| (*waker).take()) }
+                    unsafe { node.as_mut().waker.with_mut(|waker| (*waker).take()) }
                 {
                     wakers.push(waker);
                 }
@@ -348,16 +434,16 @@ impl Semaphore {
                     Self::MAX_PERMITS
                 );
 
-                // add remaining permits back
                 #[cfg(all(tokio_unstable, feature = "tracing"))]
                 self.resource_span.in_scope(|| {
                     tracing::trace!(
-                    target: "runtime::resource::state_update",
-                    permits = rem,
-                    permits.op = "add",
+                        target: "runtime.resource::state_update",
+                        permits = rem,
+                        permits.op = "add",
                     )
                 });
 
+                waiters.overtakes = 0;
                 rem = 0;
             }
 
@@ -365,8 +451,6 @@ impl Semaphore {
 
             wakers.wake_all();
         }
-
-        assert_eq!(rem, 0);
     }
 
     /// Decrease a semaphore's permits by a maximum of `n`.
@@ -530,14 +614,117 @@ impl fmt::Debug for Semaphore {
     }
 }
 
+impl Waitlist {
+    /// Selects the next waiter to assign permits to.
+    ///
+    /// Waiters are linked in arrival order (oldest at the tail of the list).
+    /// The returned tuple contains the chosen waiter, a flag indicating that
+    /// it is the oldest waiter (whose grant may be partial), and a flag
+    /// indicating that a newer high-priority waiter overtook the oldest
+    /// waiter.
+    ///
+    /// Selection rules:
+    ///
+    /// 1. Once `MAX_OVERTAKES` high-priority waiters have overtaken the
+    ///    oldest waiter in a row, the oldest waiter is always served next
+    ///    (with a partial grant if necessary). This is the anti-starvation
+    ///    guarantee.
+    /// 2. Otherwise, the queue is walked from oldest to newest. The walk
+    ///    stops looking at a given priority at the *first* waiter of that
+    ///    priority encountered: waiters at the same priority are served
+    ///    strictly in arrival order, and an older waiter (satisfiable or
+    ///    not) blocks every newer waiter of the same priority, exactly like
+    ///    the old FIFO head blocked the whole queue. A low-priority waiter is
+    ///    additionally blocked by any older high-priority waiter.
+    /// 3. If the oldest waiter at the high-priority level is fully
+    ///    satisfiable it wins. Otherwise, if the oldest low-priority waiter
+    ///    is fully satisfiable and no older waiter blocks it, it wins.
+    /// 4. Otherwise the permits accumulate with the globally oldest waiter,
+    ///    which keeps its place and waits for more (as the FIFO head did).
+    ///
+    /// When every waiter has the same priority this reduces exactly to the
+    /// old behaviour: the oldest waiter is always selected, receiving a
+    /// partial grant if it cannot yet be fully satisfied.
+    fn pick_waiter(
+        this: &MutexGuard<'_, Self>,
+        permits: usize,
+    ) -> Option<(NonNull<Waiter>, bool, bool)> {
+        // The tail of the list is the oldest waiter.
+        let oldest = this.queue.last().map(NonNull::from)?;
+
+        if this.overtakes >= MAX_OVERTAKES {
+            return Some((oldest, true, false));
+        }
+
+        // The oldest waiter seen at each priority level.
+        let mut oldest_high = None;
+        let mut oldest_low = None;
+
+        let mut cursor = Some(oldest);
+        while let Some(node) = cursor {
+            // Safety: traversal stays on pointers owned by the locked queue.
+            let waiter = unsafe { node.as_ref() };
+
+            // Only the first (oldest) waiter encountered at each level is a
+            // candidate; level FIFO never skips it.
+            match waiter.priority {
+                Priority::High if oldest_high.is_none() => oldest_high = Some(node),
+                Priority::Low if oldest_low.is_none() => oldest_low = Some(node),
+                _ => {}
+            }
+
+            // New waiters are pushed at the list head, so the `prev`
+            // pointer of the oldest (tail) waiter leads toward the head,
+            // where the newest waiters live.
+            cursor = unsafe {
+                Waiter::addr_of_pointers(node)
+                    .as_ref()
+                    .get_prev()
+            };
+        }
+
+        // A fully-satisfiable high-priority waiter overtakes lower priorities.
+        if let Some(node) = oldest_high {
+            let needs = unsafe { node.as_ref() }.state.load(Acquire);
+            if needs <= permits {
+                // A high waiter only "overtakes" when it is not itself the
+                // globally oldest waiter.
+                let overtook = node != oldest;
+                let forced = !overtook;
+                return Some((node, forced, overtook));
+            }
+        }
+
+        // A low-priority waiter may be served when fully satisfiable, unless
+        // an older high-priority waiter is still unserved.
+        if let Some(node) = oldest_low {
+            // Reaching this branch means `oldest_high` (if present) could not
+            // be fully satisfied. Since the oldest high waiter is older than
+            // the oldest low waiter (a single waiter has only one priority),
+            // the low waiter must wait behind it.
+            let blocked_by_high = oldest_high.is_some();
+            let needs = unsafe { node.as_ref() }.state.load(Acquire);
+            if needs <= permits && !blocked_by_high {
+                return Some((node, node == oldest, false));
+            }
+        }
+
+        // Nothing eligible can be fully satisfied; the globally oldest
+        // waiter accumulates the permits, like the FIFO head did.
+        Some((oldest, true, false))
+    }
+}
+
 impl Waiter {
     fn new(
         num_permits: usize,
+        priority: Priority,
         #[cfg(all(tokio_unstable, feature = "tracing"))] ctx: trace::AsyncOpTracingCtx,
     ) -> Self {
         Waiter {
             waker: UnsafeCell::new(None),
             state: AtomicUsize::new(num_permits),
+            priority,
             pointers: linked_list::Pointers::new(),
             #[cfg(all(tokio_unstable, feature = "tracing"))]
             ctx,
@@ -619,10 +806,10 @@ impl Future for Acquire<'_> {
 }
 
 impl<'a> Acquire<'a> {
-    fn new(semaphore: &'a Semaphore, num_permits: usize) -> Self {
+    fn new(semaphore: &'a Semaphore, num_permits: usize, priority: Priority) -> Self {
         #[cfg(any(not(tokio_unstable), not(feature = "tracing")))]
         return Self {
-            node: Waiter::new(num_permits),
+            node: Waiter::new(num_permits, priority),
             semaphore,
             num_permits,
             queued: false,
@@ -655,7 +842,7 @@ impl<'a> Acquire<'a> {
             };
 
             Self {
-                node: Waiter::new(num_permits, ctx),
+                node: Waiter::new(num_permits, priority, ctx),
                 semaphore,
                 num_permits,
                 queued: false,
