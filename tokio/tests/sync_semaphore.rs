@@ -4,7 +4,7 @@
 use wasm_bindgen_test::wasm_bindgen_test as test;
 
 use std::sync::Arc;
-use tokio::sync::Semaphore;
+use tokio::sync::{Priority, Semaphore};
 
 #[test]
 fn no_permits() {
@@ -351,4 +351,100 @@ fn merge_many_permits() {
 
     drop(a);
     assert_eq!(sem.available_permits(), 6_000_000_000);
+}
+
+#[tokio::test]
+#[cfg(feature = "full")]
+async fn acquire_with_priority() {
+    let sem = Arc::new(Semaphore::new(1));
+    let p1 = sem.try_acquire().unwrap();
+
+    // Queue a low-priority waiter first, then a high-priority waiter.
+    let (low_tx, mut low_rx) = tokio::sync::oneshot::channel();
+    let sem_clone = sem.clone();
+    let low = tokio::spawn(async move {
+        let _permit = sem_clone.acquire().await.unwrap();
+        low_tx.send(()).unwrap();
+    });
+
+    // Let the low-priority task enqueue itself.
+    tokio::task::yield_now().await;
+
+    let (high_tx, high_rx) = tokio::sync::oneshot::channel();
+    let (hold_tx, hold_rx) = tokio::sync::oneshot::channel::<()>();
+    let sem_clone = sem.clone();
+    let high = tokio::spawn(async move {
+        let _permit = sem_clone
+            .acquire_with_priority(Priority::High)
+            .await
+            .unwrap();
+        high_tx.send(()).unwrap();
+        // Hold the permit until the test has checked the ordering.
+        hold_rx.await.unwrap();
+    });
+
+    tokio::task::yield_now().await;
+    drop(p1);
+
+    // The high-priority waiter acquires the permit first, and the
+    // low-priority waiter is still queued.
+    high_rx.await.unwrap();
+    assert!(low_rx.try_recv().is_err());
+
+    // Releasing the high-priority permit wakes the low-priority waiter.
+    hold_tx.send(()).unwrap();
+    low_rx.await.unwrap();
+
+    low.await.unwrap();
+    high.await.unwrap();
+}
+
+#[tokio::test]
+#[cfg(feature = "full")]
+async fn acquire_many_with_priority() {
+    let sem = Semaphore::new(4);
+    let permit = sem
+        .acquire_many_with_priority(3, Priority::High)
+        .await
+        .unwrap();
+    assert_eq!(sem.available_permits(), 1);
+    drop(permit);
+    assert_eq!(sem.available_permits(), 4);
+}
+
+#[tokio::test]
+#[cfg(feature = "full")]
+async fn acquire_owned_with_priority() {
+    let sem = Arc::new(Semaphore::new(1));
+    let permit = sem
+        .clone()
+        .acquire_owned_with_priority(Priority::High)
+        .await
+        .unwrap();
+    assert_eq!(sem.available_permits(), 0);
+    drop(permit);
+    assert_eq!(sem.available_permits(), 1);
+}
+
+#[tokio::test]
+#[cfg(feature = "full")]
+async fn acquire_many_owned_with_priority() {
+    let sem = Arc::new(Semaphore::new(4));
+    let permit = sem
+        .clone()
+        .acquire_many_owned_with_priority(3, Priority::High)
+        .await
+        .unwrap();
+    assert_eq!(sem.available_permits(), 1);
+    drop(permit);
+    assert_eq!(sem.available_permits(), 4);
+}
+
+#[tokio::test]
+#[cfg(feature = "full")]
+async fn acquire_with_priority_closed() {
+    let sem = Semaphore::new(0);
+    sem.close();
+    let result = sem.acquire_with_priority(Priority::High).await;
+    assert!(result.is_err());
 }

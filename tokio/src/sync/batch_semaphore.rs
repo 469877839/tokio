@@ -15,6 +15,21 @@
 //! tasks are acquiring smaller numbers of permits. This means that in a
 //! use-case like tokio's read-write lock, writers will not be starved by
 //! readers.
+//!
+//! # Priorities
+//!
+//! The wait list is split into two FIFO queues, one for each [`Priority`]
+//! level. When permits are released, they are assigned to the oldest waiter
+//! in the high-priority queue first; the low-priority queue is only served
+//! once no high-priority waiter can use the permits. Waiters within one
+//! level are served strictly in arrival order, so a semaphore that only ever
+//! sees a single priority level behaves exactly like a single FIFO queue.
+//!
+//! To bound starvation of low-priority waiters, the semaphore counts how
+//! many high-priority waiters were woken while a low-priority waiter was
+//! queued. Once that count reaches [`LOW_PRIORITY_STARVATION_LIMIT`]
+//! consecutive wakeups, the oldest low-priority waiter is served next,
+//! before any further high-priority waiters, and the counter resets.
 use crate::loom::cell::UnsafeCell;
 use crate::loom::sync::atomic::AtomicUsize;
 use crate::loom::sync::{Mutex, MutexGuard};
@@ -41,8 +56,41 @@ pub(crate) struct Semaphore {
 }
 
 struct Waitlist {
-    queue: LinkedList<Waiter>,
+    /// FIFO queue of waiters with [`Priority::High`].
+    high: LinkedList<Waiter>,
+    /// FIFO queue of waiters with [`Priority::Low`].
+    low: LinkedList<Waiter>,
+    /// Number of consecutive high-priority waiters woken while a
+    /// low-priority waiter was queued. Reset whenever a low-priority waiter
+    /// is woken or the low-priority queue is empty.
+    high_priority_streak: usize,
     closed: bool,
+}
+
+/// The maximum number of consecutive high-priority waiters that may be
+/// woken while a low-priority waiter is queued, before the oldest
+/// low-priority waiter is served next.
+///
+/// The limit is a simple counter rather than a wall-clock timeout so that
+/// the fallback is deterministic, does not require reading a clock on the
+/// permit path, and is straightforward to test.
+pub(crate) const LOW_PRIORITY_STARVATION_LIMIT: usize = 8;
+
+impl Waitlist {
+    /// Returns `true` if the next permits should be assigned to the
+    /// high-priority queue.
+    ///
+    /// High-priority waiters are served first, unless the anti-starvation
+    /// fallback applies: once `LOW_PRIORITY_STARVATION_LIMIT` consecutive
+    /// high-priority waiters have been woken while a low-priority waiter was
+    /// queued, the oldest low-priority waiter is served next instead.
+    ///
+    /// If this returns `false` and the low-priority queue is empty, both
+    /// queues are empty.
+    fn serve_high_next(&self) -> bool {
+        !self.high.is_empty()
+            && (self.low.is_empty() || self.high_priority_streak < LOW_PRIORITY_STARVATION_LIMIT)
+    }
 }
 
 /// Error returned from the [`Semaphore::try_acquire`] function.
@@ -58,6 +106,37 @@ pub enum TryAcquireError {
     /// The semaphore has no available permits.
     NoPermits,
 }
+/// The priority level of a semaphore acquisition.
+///
+/// When permits become available, waiters with [`Priority::High`] are woken
+/// before waiters with [`Priority::Low`], regardless of the order in which
+/// they started waiting. Waiters at the same priority level are woken in
+/// the order in which they requested permits.
+///
+/// To prevent low-priority waiters from being starved by a constant stream
+/// of high-priority acquisitions, the semaphore bounds the number of
+/// consecutive high-priority wakeups while a low-priority waiter is queued;
+/// once that bound is reached, the oldest low-priority waiter is served
+/// next.
+///
+/// [`Semaphore::acquire`](crate::sync::Semaphore::acquire) and the other
+/// acquisition methods that do not take a priority use [`Priority::Low`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Priority {
+    /// The default priority. Waiters are served after all queued
+    /// high-priority waiters, subject to the anti-starvation fallback.
+    Low,
+    /// Elevated priority. Waiters are served before any queued low-priority
+    /// waiters.
+    High,
+}
+
+impl Default for Priority {
+    fn default() -> Self {
+        Priority::Low
+    }
+}
+
 /// Error returned from the [`Semaphore::acquire`] function.
 ///
 /// An `acquire` operation can only fail if the semaphore has been
@@ -89,6 +168,10 @@ struct Waiter {
     ///
     /// This may only be accessed while the wait queue is locked.
     waker: UnsafeCell<Option<Waker>>,
+
+    /// The priority level of this waiter, determining which of the two wait
+    /// queues it is linked into.
+    priority: Priority,
 
     /// Intrusive linked-list pointers.
     ///
@@ -167,7 +250,9 @@ impl Semaphore {
         Self {
             permits: AtomicUsize::new(permits << Self::PERMIT_SHIFT),
             waiters: Mutex::new(Waitlist {
-                queue: LinkedList::new(),
+                high: LinkedList::new(),
+                low: LinkedList::new(),
+                high_priority_streak: 0,
                 closed: false,
             }),
             #[cfg(all(tokio_unstable, feature = "tracing"))]
@@ -185,7 +270,9 @@ impl Semaphore {
         Self {
             permits: AtomicUsize::new(permits << Self::PERMIT_SHIFT),
             waiters: Mutex::const_new(Waitlist {
-                queue: LinkedList::new(),
+                high: LinkedList::new(),
+                low: LinkedList::new(),
+                high_priority_streak: 0,
                 closed: false,
             }),
             #[cfg(all(tokio_unstable, feature = "tracing"))]
@@ -198,7 +285,9 @@ impl Semaphore {
         Self {
             permits: AtomicUsize::new(Self::CLOSED),
             waiters: Mutex::new(Waitlist {
-                queue: LinkedList::new(),
+                high: LinkedList::new(),
+                low: LinkedList::new(),
+                high_priority_streak: 0,
                 closed: true,
             }),
             #[cfg(all(tokio_unstable, feature = "tracing"))]
@@ -212,7 +301,9 @@ impl Semaphore {
         Self {
             permits: AtomicUsize::new(Self::CLOSED),
             waiters: Mutex::const_new(Waitlist {
-                queue: LinkedList::new(),
+                high: LinkedList::new(),
+                low: LinkedList::new(),
+                high_priority_streak: 0,
                 closed: true,
             }),
             #[cfg(all(tokio_unstable, feature = "tracing"))]
@@ -250,10 +341,13 @@ impl Semaphore {
         // permit counter is closed, but the wait list is not.
         self.permits.fetch_or(Self::CLOSED, Release);
         waiters.closed = true;
-        while let Some(mut waiter) = waiters.queue.pop_back() {
-            let waker = unsafe { waiter.as_mut().waker.with_mut(|waker| (*waker).take()) };
-            if let Some(waker) = waker {
-                waker.wake();
+        let waiters = &mut *waiters;
+        for queue in [&mut waiters.high, &mut waiters.low] {
+            while let Some(mut waiter) = queue.pop_back() {
+                let waker = unsafe { waiter.as_mut().waker.with_mut(|waker| (*waker).take()) };
+                if let Some(waker) = waker {
+                    waker.wake();
+                }
             }
         }
     }
@@ -295,7 +389,15 @@ impl Semaphore {
     }
 
     pub(crate) fn acquire(&self, num_permits: usize) -> Acquire<'_> {
-        Acquire::new(self, num_permits)
+        self.acquire_with_priority(num_permits, Priority::Low)
+    }
+
+    pub(crate) fn acquire_with_priority(
+        &self,
+        num_permits: usize,
+        priority: Priority,
+    ) -> Acquire<'_> {
+        Acquire::new(self, num_permits, priority)
     }
 
     /// Release `rem` permits to the semaphore's wait list, starting from the
@@ -310,8 +412,18 @@ impl Semaphore {
         while rem > 0 {
             let mut waiters = lock.take().unwrap_or_else(|| self.waiters.lock());
             'inner: while wakers.can_push() {
+                // Permits are assigned to the oldest high-priority waiter
+                // first, unless the anti-starvation fallback gives the
+                // low-priority queue precedence. If the selected queue is
+                // empty, both queues are empty (see `Waitlist::serve_high_next`).
+                let serve_high = waiters.serve_high_next();
+                let queue = if serve_high {
+                    &mut waiters.high
+                } else {
+                    &mut waiters.low
+                };
                 // Was the waiter assigned enough permits to wake it?
-                match waiters.queue.last() {
+                match queue.last() {
                     Some(waiter) => {
                         if !waiter.assign_permits(&mut rem) {
                             break 'inner;
@@ -324,7 +436,16 @@ impl Semaphore {
                         break 'inner;
                     }
                 };
-                let mut waiter = waiters.queue.pop_back().unwrap();
+                let mut waiter = queue.pop_back().unwrap();
+                if serve_high {
+                    if waiters.low.is_empty() {
+                        waiters.high_priority_streak = 0;
+                    } else {
+                        waiters.high_priority_streak += 1;
+                    }
+                } else {
+                    waiters.high_priority_streak = 0;
+                }
                 if let Some(waker) =
                     unsafe { waiter.as_mut().waker.with_mut(|waker| (*waker).take()) }
                 {
@@ -491,6 +612,7 @@ impl Semaphore {
         }
 
         assert_eq!(acquired, 0);
+        let priority = node.priority;
         let mut old_waker = None;
 
         // Otherwise, register the waker & enqueue the node.
@@ -513,7 +635,10 @@ impl Semaphore {
                 NonNull::new_unchecked(node)
             };
 
-            waiters.queue.push_front(node);
+            match priority {
+                Priority::High => waiters.high.push_front(node),
+                Priority::Low => waiters.low.push_front(node),
+            }
         }
         drop(waiters);
         drop(old_waker);
@@ -533,11 +658,13 @@ impl fmt::Debug for Semaphore {
 impl Waiter {
     fn new(
         num_permits: usize,
+        priority: Priority,
         #[cfg(all(tokio_unstable, feature = "tracing"))] ctx: trace::AsyncOpTracingCtx,
     ) -> Self {
         Waiter {
             waker: UnsafeCell::new(None),
             state: AtomicUsize::new(num_permits),
+            priority,
             pointers: linked_list::Pointers::new(),
             #[cfg(all(tokio_unstable, feature = "tracing"))]
             ctx,
@@ -619,10 +746,10 @@ impl Future for Acquire<'_> {
 }
 
 impl<'a> Acquire<'a> {
-    fn new(semaphore: &'a Semaphore, num_permits: usize) -> Self {
+    fn new(semaphore: &'a Semaphore, num_permits: usize, priority: Priority) -> Self {
         #[cfg(any(not(tokio_unstable), not(feature = "tracing")))]
         return Self {
-            node: Waiter::new(num_permits),
+            node: Waiter::new(num_permits, priority),
             semaphore,
             num_permits,
             queued: false,
@@ -655,7 +782,7 @@ impl<'a> Acquire<'a> {
             };
 
             Self {
-                node: Waiter::new(num_permits, ctx),
+                node: Waiter::new(num_permits, priority, ctx),
                 semaphore,
                 num_permits,
                 queued: false,
@@ -698,8 +825,12 @@ impl Drop for Acquire<'_> {
 
         // remove the entry from the list
         let node = NonNull::from(&mut self.node);
+        let queue = match self.node.priority {
+            Priority::High => &mut waiters.high,
+            Priority::Low => &mut waiters.low,
+        };
         // Safety: we have locked the wait list.
-        unsafe { waiters.queue.remove(node) };
+        unsafe { queue.remove(node) };
 
         let acquired_permits = self.num_permits - self.node.state.load(Acquire);
         if acquired_permits > 0 {

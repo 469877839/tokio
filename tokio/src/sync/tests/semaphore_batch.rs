@@ -1,4 +1,4 @@
-use crate::sync::batch_semaphore::Semaphore;
+use crate::sync::batch_semaphore::{Priority, Semaphore, LOW_PRIORITY_STARVATION_LIMIT};
 use tokio_test::*;
 
 const MAX_PERMITS: usize = crate::sync::Semaphore::MAX_PERMITS;
@@ -307,4 +307,209 @@ fn update_permits_many_times() {
     assert_eq!(s.available_permits(), 3);
     assert_eq!(s.forget_permits(3), 3);
     assert_eq!(s.available_permits(), 0);
+}
+
+
+#[test]
+fn high_priority_woken_before_low() {
+    let s = Semaphore::new(1);
+    assert_ready_ok!(task::spawn(s.acquire(1)).poll());
+
+    let mut low1 = task::spawn(s.acquire_with_priority(1, Priority::Low));
+    assert_pending!(low1.poll());
+    let mut low2 = task::spawn(s.acquire_with_priority(1, Priority::Low));
+    assert_pending!(low2.poll());
+    let mut high = task::spawn(s.acquire_with_priority(1, Priority::High));
+    assert_pending!(high.poll());
+
+    // The high-priority waiter is woken first, even though it queued last.
+    s.release(1);
+    assert!(high.is_woken());
+    assert!(!low1.is_woken());
+    assert!(!low2.is_woken());
+    assert_ready_ok!(high.poll());
+
+    // The remaining waiters keep their FIFO order.
+    s.release(1);
+    assert!(low1.is_woken());
+    assert!(!low2.is_woken());
+    assert_ready_ok!(low1.poll());
+
+    s.release(1);
+    assert!(low2.is_woken());
+    assert_ready_ok!(low2.poll());
+}
+
+#[test]
+fn same_priority_is_fifo() {
+    let s = Semaphore::new(1);
+    assert_ready_ok!(task::spawn(s.acquire(1)).poll());
+
+    let mut high1 = task::spawn(s.acquire_with_priority(1, Priority::High));
+    assert_pending!(high1.poll());
+    let mut high2 = task::spawn(s.acquire_with_priority(1, Priority::High));
+    assert_pending!(high2.poll());
+
+    s.release(1);
+    assert!(high1.is_woken());
+    assert!(!high2.is_woken());
+    assert_ready_ok!(high1.poll());
+
+    s.release(1);
+    assert!(high2.is_woken());
+    assert_ready_ok!(high2.poll());
+}
+
+#[test]
+fn low_priority_served_after_starvation_limit() {
+    let s = Semaphore::new(1);
+    assert_ready_ok!(task::spawn(s.acquire(1)).poll());
+
+    let mut low = task::spawn(s.acquire_with_priority(1, Priority::Low));
+    assert_pending!(low.poll());
+
+    // High-priority waiters are served first...
+    for round in 0..LOW_PRIORITY_STARVATION_LIMIT {
+        let mut high = task::spawn(s.acquire_with_priority(1, Priority::High));
+        assert_pending!(high.poll());
+
+        s.release(1);
+        assert!(high.is_woken(), "round {round}");
+        assert!(!low.is_woken(), "round {round}");
+        assert_ready_ok!(high.poll());
+    }
+
+    // ...but after LOW_PRIORITY_STARVATION_LIMIT consecutive high-priority
+    // wakeups, the low-priority waiter goes first.
+    let mut high = task::spawn(s.acquire_with_priority(1, Priority::High));
+    assert_pending!(high.poll());
+
+    s.release(1);
+    assert!(low.is_woken());
+    assert!(!high.is_woken());
+    assert_ready_ok!(low.poll());
+
+    // The streak resets, so the high-priority waiter is served next.
+    s.release(1);
+    assert!(high.is_woken());
+    assert_ready_ok!(high.poll());
+}
+
+#[test]
+fn starvation_fallback_feeds_low_waiter_until_satisfied() {
+    let s = Semaphore::new(1);
+    assert_ready_ok!(task::spawn(s.acquire(1)).poll());
+
+    // The low-priority waiter needs two permits.
+    let mut low = task::spawn(s.acquire_with_priority(2, Priority::Low));
+    assert_pending!(low.poll());
+
+    for _ in 0..LOW_PRIORITY_STARVATION_LIMIT {
+        let mut high = task::spawn(s.acquire_with_priority(1, Priority::High));
+        assert_pending!(high.poll());
+        s.release(1);
+        assert_ready_ok!(high.poll());
+    }
+
+    // The fallback has kicked in: permits now go to the low-priority waiter
+    // until it is fully satisfied, even though a high-priority waiter is
+    // queued.
+    let mut high = task::spawn(s.acquire_with_priority(1, Priority::High));
+    assert_pending!(high.poll());
+
+    s.release(1);
+    assert!(!low.is_woken());
+    assert!(!high.is_woken());
+
+    s.release(1);
+    assert!(low.is_woken());
+    assert!(!high.is_woken());
+    assert_ready_ok!(low.poll());
+
+    s.release(1);
+    assert!(high.is_woken());
+    assert_ready_ok!(high.poll());
+}
+
+#[test]
+fn cancel_high_priority_waiter_keeps_low_waiters_woken() {
+    let s = Semaphore::new(1);
+    assert_ready_ok!(task::spawn(s.acquire(1)).poll());
+
+    let mut low = task::spawn(s.acquire_with_priority(1, Priority::Low));
+    assert_pending!(low.poll());
+    let mut high = task::spawn(s.acquire_with_priority(1, Priority::High));
+    assert_pending!(high.poll());
+
+    // Dropping the queued high-priority waiter must not disturb the
+    // low-priority queue.
+    drop(high);
+
+    s.release(1);
+    assert!(low.is_woken());
+    assert_ready_ok!(low.poll());
+    assert_eq!(0, s.available_permits());
+}
+
+#[test]
+fn cancel_low_priority_waiter_keeps_high_waiters_woken() {
+    let s = Semaphore::new(1);
+    assert_ready_ok!(task::spawn(s.acquire(1)).poll());
+
+    let mut low = task::spawn(s.acquire_with_priority(1, Priority::Low));
+    assert_pending!(low.poll());
+    let mut high = task::spawn(s.acquire_with_priority(1, Priority::High));
+    assert_pending!(high.poll());
+
+    // Dropping the queued low-priority waiter must not disturb the
+    // high-priority queue.
+    drop(low);
+
+    s.release(1);
+    assert!(high.is_woken());
+    assert_ready_ok!(high.poll());
+    assert_eq!(0, s.available_permits());
+}
+
+#[test]
+fn cancel_partially_assigned_low_waiter_redistributes_permits() {
+    let s = Semaphore::new(2);
+    assert_ready_ok!(task::spawn(s.acquire(2)).poll());
+
+    // Low-priority waiter for 2 permits; gets one permit assigned.
+    let mut low = task::spawn(s.acquire_with_priority(2, Priority::Low));
+    assert_pending!(low.poll());
+    s.release(1);
+    assert!(!low.is_woken());
+    assert_eq!(0, s.available_permits());
+
+    // A high-priority waiter jumps ahead of the half-fed low-priority waiter.
+    let mut high = task::spawn(s.acquire_with_priority(1, Priority::High));
+    assert_pending!(high.poll());
+    s.release(1);
+    assert!(high.is_woken());
+    assert_ready_ok!(high.poll());
+
+    // Dropping the low-priority waiter returns its assigned permit to the
+    // semaphore.
+    drop(low);
+    assert_eq!(1, s.available_permits());
+}
+
+#[test]
+fn close_semaphore_notifies_all_priorities() {
+    let s = Semaphore::new(1);
+    assert_ready_ok!(task::spawn(s.acquire(1)).poll());
+
+    let mut low = task::spawn(s.acquire_with_priority(1, Priority::Low));
+    assert_pending!(low.poll());
+    let mut high = task::spawn(s.acquire_with_priority(1, Priority::High));
+    assert_pending!(high.poll());
+
+    s.close();
+
+    assert!(low.is_woken());
+    assert!(high.is_woken());
+    assert_ready_err!(low.poll());
+    assert_ready_err!(high.poll());
 }

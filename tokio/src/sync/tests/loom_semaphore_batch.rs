@@ -67,6 +67,35 @@ fn release() {
 }
 
 #[test]
+fn mixed_priorities() {
+    loom::model(|| {
+        let semaphore = Arc::new(Semaphore::new(1));
+
+        let low = {
+            let semaphore = semaphore.clone();
+            thread::spawn(move || {
+                block_on(semaphore.acquire_with_priority(1, Priority::Low)).unwrap();
+                semaphore.release(1);
+            })
+        };
+
+        let high = {
+            let semaphore = semaphore.clone();
+            thread::spawn(move || {
+                block_on(semaphore.acquire_with_priority(1, Priority::High)).unwrap();
+                semaphore.release(1);
+            })
+        };
+
+        block_on(semaphore.acquire(1)).unwrap();
+        semaphore.release(1);
+
+        low.join().unwrap();
+        high.join().unwrap();
+    });
+}
+
+#[test]
 fn basic_closing() {
     const NUM: usize = 2;
 
