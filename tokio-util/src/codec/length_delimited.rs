@@ -420,6 +420,9 @@ pub struct Builder {
     // Number of bytes representing the field length
     length_field_len: usize,
 
+    // Whether the length field is a variable-length integer (varint)
+    length_field_is_varint: bool,
+
     // Number of bytes in the header before the length field
     length_field_offset: usize,
 
@@ -502,6 +505,10 @@ impl LengthDelimitedCodec {
     }
 
     fn decode_head(&mut self, src: &mut BytesMut) -> io::Result<Option<usize>> {
+        if self.builder.length_field_is_varint {
+            return self.decode_head_varint(src);
+        }
+
         let head_len = self.builder.num_head_bytes();
         let field_len = self.builder.length_field_len;
 
@@ -553,6 +560,84 @@ impl LengthDelimitedCodec {
         };
 
         src.advance(self.builder.get_num_skip());
+
+        // Ensure that the buffer has enough space to read the incoming
+        // payload
+        src.reserve(n.saturating_sub(src.len()));
+
+        Ok(Some(n))
+    }
+
+    fn decode_head_varint(&mut self, src: &mut BytesMut) -> io::Result<Option<usize>> {
+        let offset = self.builder.length_field_offset;
+
+        if src.len() < offset {
+            // Not enough data
+            return Ok(None);
+        }
+
+        // Scan the buffer without consuming it to find the end of the
+        // varint. Each byte carries 7 bits of the length; the high bit
+        // signals that another byte follows.
+        let max_varint_len = self.builder.max_varint_len();
+        let mut n = 0u64;
+        let mut shift = 0u32;
+        let mut varint_len = 0usize;
+        let mut complete = false;
+
+        for &byte in &src[offset..] {
+            n |= u64::from(byte & 0x7F) << shift;
+            varint_len += 1;
+
+            if byte & 0x80 == 0 {
+                complete = true;
+                break;
+            }
+
+            if varint_len == max_varint_len {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "varint length field exceeds maximum byte length",
+                ));
+            }
+
+            shift += 7;
+        }
+
+        if !complete {
+            // Not enough data
+            return Ok(None);
+        }
+
+        if n > self.builder.max_frame_len as u64 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                LengthDelimitedCodecError { _priv: () },
+            ));
+        }
+
+        // The check above ensures there is no overflow
+        let n = n as usize;
+
+        // Adjust `n` with bounds checking
+        let n = if self.builder.length_adjustment < 0 {
+            n.checked_sub(-self.builder.length_adjustment as usize)
+        } else {
+            n.checked_add(self.builder.length_adjustment as usize)
+        };
+
+        // Error handling
+        let n = match n {
+            Some(n) => n,
+            None => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "provided length would overflow after adjustment",
+                ));
+            }
+        };
+
+        src.advance(offset + varint_len);
 
         // Ensure that the buffer has enough space to read the incoming
         // payload
@@ -630,14 +715,33 @@ impl Encoder<&[u8]> for LengthDelimitedCodec {
             )
         })?;
 
-        // Reserve capacity in the destination buffer to fit the frame and
-        // length field.
-        dst.reserve(self.builder.length_field_len + data.len());
+        if self.builder.length_field_is_varint {
+            // Reserve capacity in the destination buffer to fit the frame
+            // and the longest possible varint length field.
+            dst.reserve(self.builder.max_varint_len() + data.len());
 
-        if self.builder.length_field_is_big_endian {
-            dst.put_uint(n as u64, self.builder.length_field_len);
+            let mut val = n as u64;
+            loop {
+                let mut byte = (val & 0x7F) as u8;
+                val >>= 7;
+                if val != 0 {
+                    byte |= 0x80;
+                }
+                dst.put_u8(byte);
+                if val == 0 {
+                    break;
+                }
+            }
         } else {
-            dst.put_uint_le(n as u64, self.builder.length_field_len);
+            // Reserve capacity in the destination buffer to fit the frame and
+            // length field.
+            dst.reserve(self.builder.length_field_len + data.len());
+
+            if self.builder.length_field_is_big_endian {
+                dst.put_uint(n as u64, self.builder.length_field_len);
+            } else {
+                dst.put_uint_le(n as u64, self.builder.length_field_len);
+            }
         }
 
         // Write the frame to the buffer
@@ -710,6 +814,9 @@ impl Builder {
 
             // Default byte length of 4
             length_field_len: 4,
+
+            // Default to a fixed-width length field.
+            length_field_is_varint: false,
 
             // Default to the header field being at the start of the header.
             length_field_offset: 0,
@@ -892,6 +999,44 @@ impl Builder {
         self
     }
 
+    /// Read the length field as a variable-length integer (varint)
+    ///
+    /// Each byte of the length field carries 7 bits of the length, starting
+    /// with the least significant group. The most significant bit of each
+    /// byte indicates whether another byte follows. The integer type set
+    /// with [`Builder::length_field_type`] (or
+    /// [`Builder::length_field_length`]) bounds the value and the encoded
+    /// size of the field: a `u32` length takes at most 5 bytes, a `u64` at
+    /// most 10. A longer varint is rejected as invalid data.
+    ///
+    /// The default setting is a fixed-width length field.
+    ///
+    /// This configuration option applies to both encoding and decoding.
+    ///
+    /// [`Builder::length_field_offset`] and [`Builder::length_adjustment`]
+    /// keep working in this mode. [`Builder::num_skip`] is not supported,
+    /// because the frame head length is not known until the varint has been
+    /// read; combining the two panics when the codec is built. The endianness
+    /// settings have no effect, as the varint byte order is fixed.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use tokio::io::AsyncRead;
+    /// use tokio_util::codec::LengthDelimitedCodec;
+    ///
+    /// # fn bind_read<T: AsyncRead>(io: T) {
+    /// LengthDelimitedCodec::builder()
+    ///     .length_field_varint()
+    ///     .new_read(io);
+    /// # }
+    /// # pub fn main() {}
+    /// ```
+    pub fn length_field_varint(&mut self) -> &mut Self {
+        self.length_field_is_varint = true;
+        self
+    }
+
     /// Sets the number of bytes in the header before the length field
     ///
     /// This configuration option only applies to decoding.
@@ -983,6 +1128,11 @@ impl Builder {
     pub fn new_codec(&self) -> LengthDelimitedCodec {
         let mut builder = *self;
 
+        assert!(
+            !(builder.length_field_is_varint && builder.num_skip.is_some()),
+            "num_skip is not supported with a varint length field"
+        );
+
         builder.adjust_max_frame_len();
 
         LengthDelimitedCodec {
@@ -1063,8 +1213,23 @@ impl Builder {
     }
 
     fn num_head_bytes(&self) -> usize {
-        let num = self.length_field_offset + self.length_field_len;
+        let num = self.length_field_offset + self.max_head_len();
         cmp::max(num, self.num_skip.unwrap_or_default())
+    }
+
+    // Number of bytes the length field occupies when it is longest. For a
+    // varint, this is the smallest number of 7-bit groups that can hold the
+    // configured integer type: 5 for `u32`, 10 for `u64`.
+    fn max_head_len(&self) -> usize {
+        if self.length_field_is_varint {
+            self.max_varint_len()
+        } else {
+            self.length_field_len
+        }
+    }
+
+    fn max_varint_len(&self) -> usize {
+        (8 * self.length_field_len).div_ceil(7)
     }
 
     fn get_num_skip(&self) -> usize {
@@ -1117,3 +1282,111 @@ impl fmt::Display for LengthDelimitedCodecError {
 }
 
 impl StdError for LengthDelimitedCodecError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn varint_codec() -> LengthDelimitedCodec {
+        LengthDelimitedCodec::builder().length_field_varint().new_codec()
+    }
+
+    #[test]
+    fn varint_roundtrip_at_carry_boundaries() {
+        let expected_heads: &[(usize, &[u8])] = &[
+            (127, &[0x7F]),
+            (128, &[0x80, 0x01]),
+            (16383, &[0xFF, 0x7F]),
+            (16384, &[0x80, 0x80, 0x01]),
+        ];
+
+        for &(len, head) in expected_heads {
+            let mut codec = varint_codec();
+            let payload = vec![0xAB; len];
+
+            let mut buf = BytesMut::new();
+            codec.encode(&payload[..], &mut buf).unwrap();
+            assert_eq!(&buf[..head.len()], head);
+
+            let frame = codec.decode(&mut buf).unwrap().unwrap();
+            assert_eq!(&frame[..], &payload[..]);
+            assert!(buf.is_empty());
+        }
+    }
+
+    #[test]
+    fn varint_decode_one_byte_at_a_time() {
+        // 300 encodes as a two byte varint head: 0xAC 0x02.
+        let payload = vec![0xCD; 300];
+        let mut encoded = BytesMut::new();
+        varint_codec().encode(&payload[..], &mut encoded).unwrap();
+
+        // Decode the whole stream at once.
+        let mut codec = varint_codec();
+        let mut buf = encoded.clone();
+        let expected = codec.decode(&mut buf).unwrap().unwrap();
+
+        // Decode the same stream one byte at a time.
+        let mut codec = varint_codec();
+        let mut buf = BytesMut::new();
+        let mut frame = None;
+        for (i, &byte) in encoded.iter().enumerate() {
+            buf.extend_from_slice(&[byte]);
+            let decoded = codec.decode(&mut buf).unwrap();
+            if i + 1 < encoded.len() {
+                assert!(decoded.is_none());
+            } else {
+                frame = decoded;
+            }
+        }
+
+        assert_eq!(frame.unwrap(), expected);
+    }
+
+    #[test]
+    fn varint_oversized_frame_rejected_without_buffering() {
+        let mut codec = LengthDelimitedCodec::builder()
+            .length_field_varint()
+            .max_frame_length(16)
+            .new_codec();
+
+        // u32::MAX as a varint head, with no payload bytes at all.
+        let mut buf = BytesMut::from(&[0xFF, 0xFF, 0xFF, 0xFF, 0x0F][..]);
+        let capacity = buf.capacity();
+
+        let err = codec.decode(&mut buf).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(err.to_string(), "frame size too big");
+
+        // The declared length must be rejected before any reservation.
+        assert_eq!(buf.capacity(), capacity);
+    }
+
+    #[test]
+    fn varint_head_too_long_is_invalid_data() {
+        // u32 length fields take at most 5 varint bytes; the error is
+        // raised as soon as the fifth byte asks for a sixth.
+        let mut codec = varint_codec();
+        let mut buf = BytesMut::from(&[0x80, 0x80, 0x80, 0x80, 0x80][..]);
+        let err = codec.decode(&mut buf).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+
+        let mut codec = varint_codec();
+        let mut buf = BytesMut::from(&[0x80, 0x80, 0x80, 0x80, 0x80, 0x80][..]);
+        let err = codec.decode(&mut buf).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn varint_eof_with_partial_frame_errors() {
+        // Partial head.
+        let mut codec = varint_codec();
+        let mut buf = BytesMut::from(&[0x80][..]);
+        assert!(codec.decode_eof(&mut buf).is_err());
+
+        // Partial payload.
+        let mut codec = varint_codec();
+        let mut buf = BytesMut::from(&[0x7F, 0x01][..]);
+        assert!(codec.decode_eof(&mut buf).is_err());
+    }
+}
