@@ -205,3 +205,40 @@ fn drop_multiple_rx_with_overflow() {
         assert_ok!(th2.join());
     });
 }
+
+#[test]
+fn broadcast_backpressure_send_async() {
+    loom::model(|| {
+        let (tx, mut rx) = broadcast::channel_with_backpressure(2);
+        let tx = Arc::new(tx);
+        let tx2 = tx.clone();
+
+        let th1 = thread::spawn(move || {
+            block_on(async {
+                assert_ok!(tx.send_async("one").await);
+                assert_ok!(tx.send_async("two").await);
+            });
+        });
+
+        let th2 = thread::spawn(move || {
+            block_on(async {
+                assert_ok!(tx2.send_async("three").await);
+            });
+        });
+
+        block_on(async {
+            let mut num = 0;
+            loop {
+                match rx.recv().await {
+                    Ok(_) => num += 1,
+                    Err(Closed) => break,
+                    Err(Lagged(_)) => panic!("lagged on a backpressure channel"),
+                }
+            }
+            assert_eq!(num, 3);
+        });
+
+        assert_ok!(th1.join());
+        assert_ok!(th2.join());
+    });
+}

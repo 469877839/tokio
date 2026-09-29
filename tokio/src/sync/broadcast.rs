@@ -58,6 +58,29 @@
 //! either by aborting its task or by tolerating lost messages and resuming
 //! consumption of the channel.
 //!
+//! ## Backpressure
+//!
+//! By default, sending never waits: when the channel is full, the oldest
+//! retained value is overwritten as described in [lagging](self#lagging). A
+//! channel created with [`channel_with_backpressure`] additionally enables
+//! waiting sends through [`Sender::send_async`]. On such a channel,
+//! `send_async` waits until the slowest active [`Receiver`] has caught up
+//! enough that the new value fits in the ring buffer without overwriting any
+//! unread value, instead of evicting the oldest value. As a result, receivers
+//! of a backpressure-enabled channel never observe [`RecvError::Lagged`] for
+//! values sent through `send_async`.
+//!
+//! The synchronous [`Sender::send`] keeps its non-blocking behavior on every
+//! channel, including backpressure-enabled ones: it overwrites the oldest
+//! retained value when the channel is full. Mixing `send` and `send_async` on
+//! the same channel can therefore still cause lagging.
+//!
+//! Note that with backpressure, a [`Receiver`] that is subscribed but never
+//! receives (and is never dropped) stalls every `send_async` call
+//! indefinitely. `send_async` waits for slow receivers forever rather than
+//! disconnecting them; applications that cannot tolerate this should drop or
+//! re-create unresponsive receivers themselves.
+//!
 //! ## Closing
 //!
 //! When **all** [`Sender`] handles have been dropped, no new values may be
@@ -71,8 +94,10 @@
 //!
 //! [`Sender`]: crate::sync::broadcast::Sender
 //! [`Sender::subscribe`]: crate::sync::broadcast::Sender::subscribe
+//! [`Sender::send_async`]: crate::sync::broadcast::Sender::send_async
 //! [`Receiver`]: crate::sync::broadcast::Receiver
 //! [`channel`]: crate::sync::broadcast::channel
+//! [`channel_with_backpressure`]: crate::sync::broadcast::channel_with_backpressure
 //! [`RecvError::Lagged`]: crate::sync::broadcast::error::RecvError::Lagged
 //! [`RecvError::Closed`]: crate::sync::broadcast::error::RecvError::Closed
 //! [`recv`]: crate::sync::broadcast::Receiver::recv
@@ -377,6 +402,29 @@ struct Shared<T> {
     /// Tail of the queue. Includes the rx wait list.
     tail: Mutex<Tail>,
 
+    /// True if the channel applies backpressure in [`Sender::send_async`].
+    ///
+    /// Set once at channel creation and never changed, so it can be read
+    /// without synchronization.
+    ///
+    /// [`Sender::send_async`]: crate::sync::broadcast::Sender::send_async
+    backpressure: bool,
+
+    /// Number of senders currently waiting for capacity in
+    /// [`Sender::send_async`].
+    ///
+    /// Receivers check this counter after releasing a slot and only run the
+    /// (more expensive) wakeup path when it is non-zero. On channels without
+    /// backpressure it stays zero, so the receive hot path only pays for a
+    /// single atomic load.
+    ///
+    /// [`Sender::send_async`]: crate::sync::broadcast::Sender::send_async
+    tx_waiters: AtomicUsize,
+
+    /// Notify senders waiting for capacity when a slot is released or the
+    /// receiver count changes.
+    notify_tx: Notify,
+
     /// Number of outstanding Sender handles.
     num_tx: AtomicUsize,
 
@@ -456,7 +504,29 @@ generate_addr_of_methods! {
 }
 
 struct RecvGuard<'a, T> {
-    slot: MutexGuard<'a, Slot<T>>,
+    slot: Option<MutexGuard<'a, Slot<T>>>,
+    shared: &'a Shared<T>,
+}
+
+/// Outcome of [`Sender::send_if_capacity`].
+enum CapacitySend<T> {
+    /// The value was sent; payload is the number of active receivers.
+    Sent(usize),
+
+    /// The channel is at capacity; the value is handed back.
+    Full(T),
+}
+
+/// Decrements the count of senders waiting for capacity when the
+/// `send_async` future completes or is dropped.
+struct TxWaiterGuard<'a, T> {
+    shared: &'a Shared<T>,
+}
+
+impl<T> Drop for TxWaiterGuard<'_, T> {
+    fn drop(&mut self) {
+        self.shared.tx_waiters.fetch_sub(1, AcqRel);
+    }
 }
 
 /// Receive a value future.
@@ -538,7 +608,60 @@ const MAX_RECEIVERS: usize = usize::MAX >> 2;
 #[track_caller]
 pub fn channel<T: Clone>(capacity: usize) -> (Sender<T>, Receiver<T>) {
     // SAFETY: In the line below we are creating one extra receiver, so there will be 1 in total.
-    let tx = unsafe { Sender::new_with_receiver_count(1, capacity) };
+    let tx = unsafe { Sender::new_with_receiver_count(1, capacity, false) };
+    let rx = Receiver {
+        shared: tx.shared.clone(),
+        next: 0,
+    };
+    (tx, rx)
+}
+
+/// Create a bounded, multi-producer, multi-consumer channel where each sent
+/// value is broadcasted to all active receivers, and where senders can
+/// optionally wait for capacity instead of overwriting unread values.
+///
+/// This is identical to [`channel`], except that the channel is created in
+/// backpressure mode: [`Sender::send_async`] waits for the slowest active
+/// [`Receiver`] to catch up when the ring buffer is full rather than
+/// overwriting the oldest retained value. See [backpressure](self#backpressure)
+/// for details.
+///
+/// The synchronous [`Sender::send`] behaves exactly as on a channel created
+/// with [`channel`]: it never waits and overwrites the oldest retained value
+/// when the channel is full.
+///
+/// [`channel`]: crate::sync::broadcast::channel
+/// [`Sender::send_async`]: crate::sync::broadcast::Sender::send_async
+/// [`Sender::send`]: crate::sync::broadcast::Sender::send
+/// [`Receiver`]: crate::sync::broadcast::Receiver
+///
+/// # Examples
+///
+/// ```
+/// use tokio::sync::broadcast;
+///
+/// # #[tokio::main(flavor = "current_thread")]
+/// # async fn main() {
+/// let (tx, mut rx) = broadcast::channel_with_backpressure(2);
+///
+/// tx.send_async(10).await.unwrap();
+/// tx.send_async(20).await.unwrap();
+///
+/// assert_eq!(rx.recv().await.unwrap(), 10);
+/// assert_eq!(rx.recv().await.unwrap(), 20);
+/// # }
+/// ```
+///
+/// # Panics
+///
+/// This will panic if `capacity` is equal to `0` or exceeds `usize::MAX / 2`.
+///
+/// This pre-allocates space for `capacity` messages. Allocation failure may result in a panic or
+/// [an allocation error](std::alloc::handle_alloc_error).
+#[track_caller]
+pub fn channel_with_backpressure<T: Clone>(capacity: usize) -> (Sender<T>, Receiver<T>) {
+    // SAFETY: In the line below we are creating one extra receiver, so there will be 1 in total.
+    let tx = unsafe { Sender::new_with_receiver_count(1, capacity, true) };
     let rx = Receiver {
         shared: tx.shared.clone(),
         next: 0,
@@ -556,7 +679,7 @@ impl<T> Sender<T> {
     #[track_caller]
     pub fn new(capacity: usize) -> Self {
         // SAFETY: We don't create extra receivers, so there are 0.
-        unsafe { Self::new_with_receiver_count(0, capacity) }
+        unsafe { Self::new_with_receiver_count(0, capacity, false) }
     }
 
     /// Creates the sending-half of the [`broadcast`](self) channel, and provide the receiver
@@ -571,7 +694,11 @@ impl<T> Sender<T> {
     /// the channel functionalities are used, the count is zero by default, as this function
     /// does not create any receivers by itself.
     #[track_caller]
-    unsafe fn new_with_receiver_count(receiver_count: usize, mut capacity: usize) -> Self {
+    unsafe fn new_with_receiver_count(
+        receiver_count: usize,
+        mut capacity: usize,
+        backpressure: bool,
+    ) -> Self {
         assert!(capacity > 0, "broadcast channel capacity cannot be zero");
         assert!(
             capacity <= usize::MAX >> 1,
@@ -598,6 +725,9 @@ impl<T> Sender<T> {
                 closed: receiver_count == 0,
                 waiters: LinkedList::new(),
             }),
+            backpressure,
+            tx_waiters: AtomicUsize::new(0),
+            notify_tx: Notify::new(),
             num_tx: AtomicUsize::new(1),
             num_weak_tx: AtomicUsize::new(0),
             notify_last_rx_drop: Notify::new(),
@@ -658,12 +788,153 @@ impl<T> Sender<T> {
     /// # }
     /// ```
     pub fn send(&self, value: T) -> Result<usize, SendError<T>> {
-        let mut tail = self.shared.tail.lock();
+        let tail = self.shared.tail.lock();
 
         if tail.rx_cnt == 0 {
             return Err(SendError(value));
         }
 
+        Ok(self.send_locked(tail, value))
+    }
+
+    /// Sends a value to all active [`Receiver`] handles, waiting for capacity
+    /// if the channel is full.
+    ///
+    /// On a channel created with [`channel_with_backpressure`], when the ring
+    /// buffer is full this method waits until the slowest active [`Receiver`]
+    /// has caught up enough that the value can be written without overwriting
+    /// a value that some active receiver has not read yet. Values sent this
+    /// way are never overwritten before all active receivers have seen them,
+    /// so receivers never observe [`RecvError::Lagged`] because of
+    /// `send_async`. See [backpressure](self#backpressure) for details.
+    ///
+    /// On a channel created with [`channel`] (i.e. without backpressure),
+    /// this method never waits and behaves exactly like [`send`]: a full
+    /// channel causes the oldest retained value to be overwritten.
+    ///
+    /// A waiting send completes with `Err(SendError)` if all [`Receiver`]
+    /// handles are dropped while it is waiting, returning the value back.
+    ///
+    /// Note that a [`Receiver`] that never receives (and is never dropped)
+    /// stalls this method indefinitely; `send_async` waits for slow receivers
+    /// forever rather than disconnecting them.
+    ///
+    /// # Return
+    ///
+    /// Like [`send`], a successful send returns the number of subscribed
+    /// [`Receiver`] handles at the time the value was written. This does not
+    /// mean that this number of receivers will see the message as a receiver
+    /// may drop before receiving the message.
+    ///
+    /// # Cancel safety
+    ///
+    /// This method is cancel safe. The value is only written to the channel
+    /// once capacity is available, in a single step. If the returned future
+    /// is dropped before completing, the value is dropped together with the
+    /// future: it is never half-sent, and no slot in the ring buffer is
+    /// reserved or leaked.
+    ///
+    /// [`channel`]: crate::sync::broadcast::channel
+    /// [`channel_with_backpressure`]: crate::sync::broadcast::channel_with_backpressure
+    /// [`send`]: crate::sync::broadcast::Sender::send
+    /// [`Receiver`]: crate::sync::broadcast::Receiver
+    /// [`RecvError::Lagged`]: crate::sync::broadcast::error::RecvError::Lagged
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use tokio::sync::broadcast;
+    ///
+    /// # #[tokio::main(flavor = "current_thread")]
+    /// # async fn main() {
+    /// let (tx, mut rx) = broadcast::channel_with_backpressure(2);
+    ///
+    /// tx.send_async(10).await.unwrap();
+    /// tx.send_async(20).await.unwrap();
+    ///
+    /// // The channel is full; this send waits until `rx` reads a value.
+    /// let send = tokio::spawn(async move {
+    ///     tx.send_async(30).await.unwrap();
+    ///     tx
+    /// });
+    ///
+    /// assert_eq!(rx.recv().await.unwrap(), 10);
+    /// let tx = send.await.unwrap();
+    ///
+    /// assert_eq!(rx.recv().await.unwrap(), 20);
+    /// assert_eq!(rx.recv().await.unwrap(), 30);
+    /// # }
+    /// ```
+    pub async fn send_async(&self, value: T) -> Result<usize, SendError<T>> {
+        if !self.shared.backpressure {
+            return self.send(value);
+        }
+
+        // Announce that a sender is (about to be) waiting for capacity.
+        // This must happen before any check that can decide to sleep:
+        // receivers only run the wakeup path when the counter is non-zero.
+        // The guard undoes the increment when the future completes or is
+        // dropped.
+        self.shared.tx_waiters.fetch_add(1, AcqRel);
+        let _guard = TxWaiterGuard {
+            shared: &self.shared,
+        };
+
+        let mut value = value;
+        loop {
+            // Register for a wakeup **before** checking for capacity.
+            // `Notify::notify_waiters` also reaches `Notified` futures that
+            // have been created but not yet polled, so a slot released
+            // between the check and the `await` below is not missed.
+            let notified = self.shared.notify_tx.notified();
+
+            match self.send_if_capacity(value) {
+                Ok(CapacitySend::Sent(rem)) => return Ok(rem),
+                Ok(CapacitySend::Full(v)) => value = v,
+                Err(e) => return Err(e),
+            }
+
+            notified.await;
+        }
+    }
+
+    /// Attempts to send a value without overwriting any value that an active
+    /// receiver has not read yet.
+    ///
+    /// Returns `CapacitySend::Full` with the value back if the channel is at
+    /// capacity, and `SendError` with the value back if there are no active
+    /// receivers.
+    fn send_if_capacity(&self, value: T) -> Result<CapacitySend<T>, SendError<T>> {
+        let tail = self.shared.tail.lock();
+
+        if tail.rx_cnt == 0 {
+            return Err(SendError(value));
+        }
+
+        // Index of the slot that a write at the current tail position would
+        // reuse.
+        let idx = (tail.pos & self.shared.mask as u64) as usize;
+
+        if self.shared.buffer[idx].lock().rem != 0 {
+            // The value currently held by that slot has not been seen by all
+            // receivers that were active when it was sent, i.e. the slowest
+            // active receiver has not read past this position yet. Writing
+            // now would overwrite that unread value, so the send has to wait
+            // for the receivers to catch up.
+            return Ok(CapacitySend::Full(value));
+        }
+
+        // `rem` is only ever set to a non-zero value by a send, and sending
+        // requires the tail lock that is held here. The observed zero is
+        // therefore still valid when `send_locked` re-acquires the slot lock.
+        Ok(CapacitySend::Sent(self.send_locked(tail, value)))
+    }
+
+    /// Writes `value` at the current tail position and notifies receivers.
+    ///
+    /// The tail lock must be held and there must be at least one active
+    /// receiver. Returns the number of active receivers.
+    fn send_locked(&self, mut tail: MutexGuard<'_, Tail>, value: T) -> usize {
         // Position to write into
         let pos = tail.pos;
         let rem = tail.rx_cnt;
@@ -692,7 +963,7 @@ impl<T> Sender<T> {
         // thread is in the critical section.
         self.shared.notify_rx(tail);
 
-        Ok(rem)
+        rem
     }
 
     /// Creates a new [`Receiver`] handle that will receive values sent **after**
@@ -1346,7 +1617,10 @@ impl<T> Receiver<T> {
                 if missed == 0 {
                     self.next = self.next.wrapping_add(1);
 
-                    return Ok(RecvGuard { slot });
+                    return Ok(RecvGuard {
+                        slot: Some(slot),
+                        shared: &self.shared,
+                    });
                 }
 
                 self.next = next;
@@ -1357,7 +1631,10 @@ impl<T> Receiver<T> {
 
         self.next = self.next.wrapping_add(1);
 
-        Ok(RecvGuard { slot })
+        Ok(RecvGuard {
+            slot: Some(slot),
+            shared: &self.shared,
+        })
     }
 
     /// Returns the number of [`Sender`] handles.
@@ -1608,6 +1885,13 @@ impl<T> Drop for Receiver<T> {
                 Err(TryRecvError::Empty) => panic!("unexpected empty broadcast channel"),
             }
         }
+
+        // Dropping this receiver released its unread slots and may have
+        // reduced the receiver count to zero; both can unblock senders
+        // waiting for capacity.
+        if self.shared.backpressure && self.shared.tx_waiters.load(Acquire) != 0 {
+            self.shared.notify_tx.notify_waiters();
+        }
     }
 }
 
@@ -1742,16 +2026,39 @@ impl<'a, T> RecvGuard<'a, T> {
     where
         T: Clone,
     {
-        self.slot.val.clone()
+        self.slot.as_ref().unwrap().val.clone()
     }
 }
 
 impl<'a, T> Drop for RecvGuard<'a, T> {
     fn drop(&mut self) {
+        let mut slot = self
+            .slot
+            .take()
+            .expect("RecvGuard slot taken before drop");
+
         // Decrement the remaining counter
-        self.slot.rem -= 1;
-        if self.slot.rem == 0 {
-            self.slot.val = None;
+        slot.rem -= 1;
+        if slot.rem != 0 {
+            return;
+        }
+
+        slot.val = None;
+
+        // The slot has been seen by every receiver and can now be
+        // overwritten. Wake senders waiting for capacity, if any. The
+        // counter check keeps this path to a single atomic load when no
+        // sender is waiting, which is always the case on channels without
+        // backpressure.
+        let notify =
+            self.shared.backpressure && self.shared.tx_waiters.load(Acquire) != 0;
+
+        // Release the slot lock before waking: a waker is allowed to
+        // re-enter the channel.
+        drop(slot);
+
+        if notify {
+            self.shared.notify_tx.notify_waiters();
         }
     }
 }

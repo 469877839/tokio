@@ -957,3 +957,253 @@ fn receiver_len_after_lag_error_advances_cursor() {
     assert_eq!(assert_recv!(rx), 4);
     assert_eq!(rx.len(), 0);
 }
+
+#[test]
+fn send_async_waits_for_capacity() {
+    let (tx, mut rx) = broadcast::channel_with_backpressure(2);
+
+    // The channel is not full; both sends complete without waiting.
+    assert_ok!(tokio_test::block_on(tx.send_async(10)));
+    assert_ok!(tokio_test::block_on(tx.send_async(20)));
+
+    // The channel is now full: the next send waits for the receiver.
+    let tx2 = tx.clone();
+    let mut send = task::spawn(async move { tx2.send_async(30).await });
+    assert_pending!(send.poll());
+
+    // Reading one value frees a slot and wakes the waiting send.
+    assert_eq!(assert_recv!(rx), 10);
+    assert!(send.is_woken());
+    assert_eq!(assert_ready_ok!(send.poll()), 1);
+
+    assert_eq!(assert_recv!(rx), 20);
+    assert_eq!(assert_recv!(rx), 30);
+    assert_empty!(rx);
+}
+
+#[tokio::test]
+async fn send_async_never_lags() {
+    let (tx, mut rx) = broadcast::channel_with_backpressure(4);
+
+    let producer = tokio::spawn(async move {
+        for i in 0..100 {
+            tx.send_async(i).await.unwrap();
+        }
+    });
+
+    // Every value arrives, in order, with no `Lagged` error.
+    for i in 0..100 {
+        assert_eq!(rx.recv().await.unwrap(), i);
+    }
+
+    producer.await.unwrap();
+}
+
+#[test]
+fn send_async_no_receivers() {
+    let (tx, rx) = broadcast::channel_with_backpressure(2);
+    drop(rx);
+
+    // Fails immediately, returning the value.
+    let err = assert_err!(tokio_test::block_on(tx.send_async("lost")));
+    assert_eq!(err.0, "lost");
+}
+
+#[test]
+fn send_async_waiting_fails_when_last_receiver_drops() {
+    let (tx, rx) = broadcast::channel_with_backpressure(1);
+
+    assert_ok!(tokio_test::block_on(tx.send_async(10)));
+
+    // The channel is full; this send parks.
+    let tx2 = tx.clone();
+    let mut send = task::spawn(async move { tx2.send_async(20).await });
+    assert_pending!(send.poll());
+
+    // Dropping the only receiver wakes the waiting send, which then fails
+    // and returns the value.
+    drop(rx);
+    assert!(send.is_woken());
+    let err = assert_ready_err!(send.poll());
+    assert_eq!(err.0, 20);
+}
+
+#[test]
+fn send_async_cancel_safe() {
+    let (tx, mut rx) = broadcast::channel_with_backpressure(1);
+
+    assert_ok!(tokio_test::block_on(tx.send_async(10)));
+
+    // Park a send, then drop the future before it completes.
+    {
+        let tx2 = tx.clone();
+        let mut send = task::spawn(async move { tx2.send_async(20).await });
+        assert_pending!(send.poll());
+    }
+
+    // The dropped send neither wrote its value nor reserved a slot: the
+    // next send still has to wait for capacity, and 20 never shows up.
+    let tx3 = tx.clone();
+    let mut send = task::spawn(async move { tx3.send_async(30).await });
+    assert_pending!(send.poll());
+
+    assert_eq!(assert_recv!(rx), 10);
+    assert!(send.is_woken());
+    assert_eq!(assert_ready_ok!(send.poll()), 1);
+
+    assert_eq!(assert_recv!(rx), 30);
+    assert_empty!(rx);
+}
+
+#[test]
+fn send_async_unblocked_by_receiver_drop() {
+    let (tx, mut rx1) = broadcast::channel_with_backpressure(1);
+    let rx2 = tx.subscribe();
+
+    assert_ok!(tokio_test::block_on(tx.send_async(10)));
+
+    // `rx2` never reads; the send waits for it.
+    let tx2 = tx.clone();
+    let mut send = task::spawn(async move { tx2.send_async(20).await });
+    assert_pending!(send.poll());
+
+    // `rx1` reads, but `rx2` still pins the slot.
+    assert_eq!(assert_recv!(rx1), 10);
+    assert!(!send.is_woken());
+
+    // Dropping the lagging receiver releases the slot and the send
+    // completes.
+    drop(rx2);
+    assert!(send.is_woken());
+    assert_eq!(assert_ready_ok!(send.poll()), 1);
+
+    assert_eq!(assert_recv!(rx1), 20);
+    assert_empty!(rx1);
+}
+
+#[test]
+fn send_async_subscribe_while_waiting() {
+    let (tx, mut rx1) = broadcast::channel_with_backpressure(1);
+
+    assert_ok!(tokio_test::block_on(tx.send_async(10)));
+
+    let tx2 = tx.clone();
+    let mut send = task::spawn(async move { tx2.send_async(20).await });
+    assert_pending!(send.poll());
+
+    // A new subscriber starts at the current tail and does not unblock the
+    // pending send.
+    let mut rx2 = tx.subscribe();
+    assert_pending!(send.poll());
+
+    assert_eq!(assert_recv!(rx1), 10);
+    assert!(send.is_woken());
+    // Both receivers are active by the time the value is written.
+    assert_eq!(assert_ready_ok!(send.poll()), 2);
+
+    assert_eq!(assert_recv!(rx1), 20);
+    assert_eq!(assert_recv!(rx2), 20);
+}
+
+#[tokio::test]
+async fn send_async_multiple_waiting_senders() {
+    let (tx, mut rx) = broadcast::channel_with_backpressure(2);
+
+    let tx1 = tx.clone();
+    let p1 = tokio::spawn(async move {
+        for i in 0..10 {
+            tx1.send_async(2 * i).await.unwrap();
+        }
+    });
+    let p2 = tokio::spawn(async move {
+        for i in 0..10 {
+            tx.send_async(2 * i + 1).await.unwrap();
+        }
+    });
+
+    // No value is lost and no receiver lags, regardless of send order.
+    let mut seen = Vec::new();
+    for _ in 0..20 {
+        seen.push(rx.recv().await.unwrap());
+    }
+    seen.sort_unstable();
+    assert_eq!(seen, (0..20).collect::<Vec<_>>());
+
+    p1.await.unwrap();
+    p2.await.unwrap();
+}
+
+#[test]
+fn send_async_without_backpressure_overwrites() {
+    let (tx, mut rx) = broadcast::channel(2);
+
+    assert_ok!(tokio_test::block_on(tx.send_async(10)));
+    assert_ok!(tokio_test::block_on(tx.send_async(20)));
+    // On a channel without backpressure, `send_async` never waits and
+    // overwrites the oldest value, exactly like `send`.
+    assert_ok!(tokio_test::block_on(tx.send_async(30)));
+
+    assert_lagged!(rx.try_recv(), 1);
+    assert_eq!(assert_recv!(rx), 20);
+    assert_eq!(assert_recv!(rx), 30);
+    assert_empty!(rx);
+}
+
+#[test]
+fn sync_send_still_overwrites_with_backpressure() {
+    let (tx, mut rx) = broadcast::channel_with_backpressure(2);
+
+    assert_ok!(tx.send(10));
+    assert_ok!(tx.send(20));
+    // The synchronous send keeps its non-blocking behavior even on a
+    // backpressure channel.
+    assert_ok!(tx.send(30));
+
+    assert_lagged!(rx.try_recv(), 1);
+    assert_eq!(assert_recv!(rx), 20);
+    assert_eq!(assert_recv!(rx), 30);
+    assert_empty!(rx);
+}
+
+#[test]
+fn send_async_waker_may_reenter_channel() {
+    use futures::task::ArcWake;
+    use std::future::Future;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::task::Context;
+
+    struct SendOnWake(broadcast::Sender<i32>, AtomicBool);
+
+    impl ArcWake for SendOnWake {
+        fn wake_by_ref(arc_self: &Arc<Self>) {
+            // Re-enter the channel from inside a wake; must not deadlock.
+            if !arc_self.1.swap(true, Ordering::SeqCst) {
+                let _ = arc_self.0.send(0);
+            }
+        }
+    }
+
+    let (tx, mut rx) = broadcast::channel_with_backpressure(1);
+    assert_ok!(tx.send(1));
+
+    let tx2 = tx.clone();
+    let mut fut = Box::pin(async move { tx2.send_async(2).await });
+
+    let waker = futures::task::waker(Arc::new(SendOnWake(tx.clone(), AtomicBool::new(false))));
+    let mut cx = Context::from_waker(&waker);
+    assert!(fut.as_mut().poll(&mut cx).is_pending());
+
+    // Frees the slot; the notification wakes the re-entrant waker, which
+    // synchronously sends another value.
+    assert_eq!(assert_recv!(rx), 1);
+
+    // The re-entrant send filled the channel again.
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    assert!(fut.as_mut().poll(&mut cx).is_pending());
+
+    assert_eq!(assert_recv!(rx), 0);
+    let v = assert_ready_ok!(fut.as_mut().poll(&mut cx));
+    assert_eq!(v, 1);
+    assert_eq!(assert_recv!(rx), 2);
+    assert_empty!(rx);
+}
