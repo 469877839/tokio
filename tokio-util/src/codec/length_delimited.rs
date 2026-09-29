@@ -420,6 +420,10 @@ pub struct Builder {
     // Number of bytes representing the field length
     length_field_len: usize,
 
+    // How the length field is encoded: a fixed-width integer or a variable
+    // length integer (LEB128 / unsigned varint).
+    length_field_kind: LengthFieldKind,
+
     // Number of bytes in the header before the length field
     length_field_offset: usize,
 
@@ -432,6 +436,16 @@ pub struct Builder {
 
     // Length field byte order (little or big endian)
     length_field_is_big_endian: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LengthFieldKind {
+    /// The length field is a fixed-width big or little endian integer.
+    Fixed,
+    /// The length field is an unsigned variable length integer (LEB128):
+    /// each byte carries seven bits of value and its most significant bit
+    /// indicates that another byte follows.
+    Varint,
 }
 
 /// An error when the number of bytes read is more than max frame length.
@@ -460,6 +474,71 @@ pub struct LengthDelimitedCodec {
 enum DecodeState {
     Head,
     Data(usize),
+}
+
+// The result of scanning a variable length integer without consuming it.
+enum VarintScan {
+    // A terminating byte (continuation bit cleared) has not been seen yet.
+    Incomplete,
+    // The full varint is present: its length in bytes and decoded value.
+    Complete { len: usize, value: u64 },
+}
+
+/// Scan an unsigned LEB128 / varint at the start of `src` without consuming
+/// any bytes.
+///
+/// Each byte contributes seven bits; the most significant bit indicates that
+/// another byte follows. A varint is capped at five bytes for a 32 bit field
+/// and ten bytes for a 64 bit field; anything longer is rejected as invalid
+/// data. Values that do not fit in the configured field width are rejected as
+/// well.
+fn scan_varint(
+    src: &[u8],
+    field_width: usize,
+    max_field_len: usize,
+) -> io::Result<VarintScan> {
+    let mut value: u64 = 0;
+    let mut shift: u32 = 0;
+
+    for (idx, &byte) in src.iter().enumerate() {
+        if idx >= max_field_len {
+            // Either more than the maximum number of continuation bytes or a
+            // terminating byte beyond the cap.
+            return Err(invalid_varint());
+        }
+
+        value |= ((byte & 0x7f) as u64)
+            .checked_shl(shift)
+            .ok_or_else(invalid_varint)?;
+        shift += 7;
+
+        if byte & 0x80 == 0 {
+            // The last byte may only carry as many value bits as the field
+            // width leaves room for.
+            let extra_bits = ((max_field_len * 7) % 8) as u32;
+            if extra_bits != 0 && idx + 1 == max_field_len && byte >> extra_bits != 0 {
+                return Err(invalid_varint());
+            }
+
+            if field_width < 8 && value >> (field_width * 8) != 0 {
+                return Err(invalid_varint());
+            }
+
+            return Ok(VarintScan::Complete {
+                len: idx + 1,
+                value,
+            });
+        }
+    }
+
+    Ok(VarintScan::Incomplete)
+}
+
+fn invalid_varint() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        "invalid variable length integer in length field",
+    )
 }
 
 // ===== impl LengthDelimitedCodec ======
@@ -502,6 +581,13 @@ impl LengthDelimitedCodec {
     }
 
     fn decode_head(&mut self, src: &mut BytesMut) -> io::Result<Option<usize>> {
+        match self.builder.length_field_kind {
+            LengthFieldKind::Fixed => self.decode_head_fixed(src),
+            LengthFieldKind::Varint => self.decode_head_varint(src),
+        }
+    }
+
+    fn decode_head_fixed(&mut self, src: &mut BytesMut) -> io::Result<Option<usize>> {
         let head_len = self.builder.num_head_bytes();
         let field_len = self.builder.length_field_len;
 
@@ -556,6 +642,70 @@ impl LengthDelimitedCodec {
 
         // Ensure that the buffer has enough space to read the incoming
         // payload
+        src.reserve(n.saturating_sub(src.len()));
+
+        Ok(Some(n))
+    }
+
+    fn decode_head_varint(&mut self, src: &mut BytesMut) -> io::Result<Option<usize>> {
+        let offset = self.builder.length_field_offset;
+        let max_field_len = self.builder.varint_max_field_len();
+
+        // Wait until the fixed prefix before the length field is available.
+        if src.len() < offset {
+            return Ok(None);
+        }
+
+        // The variable length field is only known to be complete once a byte
+        // with its continuation bit cleared is seen. While it is still
+        // incomplete the buffer is bounded by the offset plus the longest
+        // possible varint, so a peer can never force unbounded buffering.
+        let scan = scan_varint(&src[offset..], self.builder.length_field_len, max_field_len)?;
+
+        let (field_len, n) = match scan {
+            VarintScan::Incomplete => return Ok(None),
+            VarintScan::Complete { len, value } => (len, value),
+        };
+
+        if n > self.builder.max_frame_len as u64 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                LengthDelimitedCodecError { _priv: () },
+            ));
+        }
+
+        // The check above ensures there is no overflow
+        let n = n as usize;
+
+        // Adjust `n` with bounds checking
+        let n = if self.builder.length_adjustment < 0 {
+            n.checked_sub(-self.builder.length_adjustment as usize)
+        } else {
+            n.checked_add(self.builder.length_adjustment as usize)
+        };
+
+        let n = n.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "provided length would overflow after adjustment",
+            )
+        })?;
+
+        let skip = self
+            .builder
+            .num_skip
+            .unwrap_or(offset + field_len);
+
+        // A custom `num_skip` may point past the length field into extra
+        // frame head bytes; those must be present as well.
+        if src.len() < skip {
+            return Ok(None);
+        }
+
+        src.advance(skip);
+
+        // Ensure that the buffer has enough space to read the incoming
+        // payload. The varint head itself is bounded by `max_field_len`.
         src.reserve(n.saturating_sub(src.len()));
 
         Ok(Some(n))
